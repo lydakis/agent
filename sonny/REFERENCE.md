@@ -170,12 +170,15 @@ Press `/projects` (or `←` on an empty composer) to browse all projects in plac
 
 - Rows stay in stable title order; nested projects indent beneath parent folders; `superlead` projects are tagged `superlead`; projects inactive for 7+ days fold into `▸ N idle projects`.
 - **Keys:** `↑`/`↓` select, `Enter`/`→` open lead, `←` jump to parent project, `Ctrl+F` filter, `Esc` return.
+- **Pinned agents:** `/pin` in any agent's window (or `p` on a project's row, or on an agent picked in the pane's list) pins it at the top of Projects, numbered; `←` then its number (`1`–`9`) opens it from anywhere. The same again unpins; nine at most.
 - **Fast switching inside a project (empty composer):**
   - `Alt+←` / `Alt+→` (or `Ctrl+←` / `Ctrl+→`): step through agents in this project.
   - `→` (or `Tab`): move keyboard focus to the side pane (`←` returns from page 1).
   - `Alt+N` (or click `← ? N` in the footer): jump to the next agent needing your approval or answer across **any** project, landing on its card.
 
 ![Projects at 150, 120, 60 and 44 columns: a superlead with two projects under it, a third outside it, four idle projects folded; the pane shows the picked project's agents where there is room](../docs/sonny/projects-projects.png)
+
+![Projects with three agents pinned above the projects, one of them not there any more, and none, at 150, 120, 60 and 44 columns](../docs/sonny/projects-pinned.png)
 
 <details>
 <summary><strong>Full details: projects</strong></summary>
@@ -196,6 +199,29 @@ row under the page's title, and `esc` puts back the
 conversation and what the pane showed. The empty composer says
 `← projects`. Zen, a side chat and an agent shown beside keep you where you
 are: `←` there does nothing.
+
+**Pinned agents** are the few you want closer than their project: a lead
+or a task from any project. Each is a numbered row at the top of
+Projects, under a muted `Pinned`: its number, its state mark, its title
+and its name, a link. `1` to `9` go to that agent at once, wherever the
+pick is, by the name the pin holds, so `←` then a number works before
+Projects has read anything (on the agent you are on, the view closes;
+while you find, a number is typed). `↑` from the first project goes into
+Pinned and the pane follows to that agent's project; `enter` or `→` goes
+to it. `/pin` in any agent's window pins that agent (`pinned as 3 · ← 3
+opens it`), and reads "Unpin this agent" while it is pinned; `p` on a
+project's row in Projects pins its lead, `p` on a pinned row unpins it,
+and `p` on the agent picked in the pane's list of agents pins it there,
+its row unchanged. Nine at most (`9 pinned · unpin one first`). Numbers
+are the order you pinned in and move only when you unpin. Nothing pins or
+unpins for you: a done agent keeps its row and mark, and one not there any
+more keeps its row in muted words, its number answered `NAME is not
+there`, until `p` clears it. With nothing pinned the section is not drawn.
+The pins are one small file beside the store (`STORE.pinned`, a name a
+line), shared by every window and replaced whole by a rename; a window
+reads it as it starts and as Projects opens, and writes it, beside the
+window, never while drawing or taking a key. Their marks and titles come
+from what Projects already reads.
 
 Inside a project, with nothing typed, `→` gives the keys to the pane as
 `tab` does, and `←` at the pane's first page, with nothing left to close,
@@ -1218,7 +1244,7 @@ has something on it, or is off the screen, no time shows.
 
 Type `/` to open the fuzzy command menu (ranked by frequency and recency in `~/.agent/sonny/picks.json`). Typos like `/stauts` stay in the composer instead of sending; paths like `/etc/hosts is wrong` send normally.
 
-**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters, `Ctrl+F` finds) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/quit` (exit window, leaving daemon and turns running).
+**Quick commands:** `/copy` (copy last reply) · `/verbose` (toggle all tool calls in this window) · `/compact` (confirm & summarize conversation now; daemon also auto-compacts at `compact_tokens` and between turns at 70% context) · `/retry` (inspect and allow one retry of a reviewer-denied call) · `/margin` (reopen margin) · `/mcp` (list MCP servers & tools) · `/audit` (view tool audit trail: `a` all agents, `t`/`p`/`w` filters, `Ctrl+F` finds) · `/pause REASON` & `/resume` (fleet-wide andon cord) · `/pin` (pin this agent at the top of Projects, `←` then its number opens it; again unpins) · `/quit` (exit window, leaving daemon and turns running).
 
 ### `/side` — Mid-turn side chats
 
