@@ -43,6 +43,9 @@ pub const GROUPS: &[&str] = &[
 ];
 
 const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+/// What a bare `sonny` opens: `folder`, or an agent's whole name, which
+/// `/config` steps to from the agent its window shows.
+const OPENS: &str = "sonny.opens";
 /// A switch, written as TOML's own true or false.
 const SWITCH: &[&str] = &["true", "false"];
 /// What `trailer` lists, each written as a TOML list of its words.
@@ -139,6 +142,15 @@ pub const SETTINGS: &[Setting] = &[
         about: "how long a call in Auto waits for the reviewer's verdict, every attempt included, before it is denied as not reviewed and the agent told so; 0 waits as long as it takes",
         values: &[],
         default: "90000",
+    },
+    Setting {
+        key: OPENS,
+        group: "Agents",
+        name: "sonny opens",
+        label: "what a bare sonny opens: this folder's lead, or one agent anywhere",
+        about: "what a bare `sonny` opens: `folder`, the lead of the folder it runs in, made there the first time; or an agent by its whole name, from any folder, making nothing, and when it is not there saying so and opening nothing. `sonny .` or `sonny DIR` opens that folder's lead either way; `/config` steps between the folder and the agent its window shows",
+        values: &["folder"],
+        default: "this folder's lead",
     },
     Setting {
         key: "sonny.default_permissions",
@@ -867,6 +879,7 @@ pub fn skill() -> String {
         .iter()
         .map(|setting| {
             let values = match setting.values {
+                _ if setting.key == OPENS => "`folder`, or an agent's whole name".to_owned(),
                 [] if number(setting) => "a whole number".to_owned(),
                 [] if span(setting) => "a span, as `30s`, `15m` or `1h`".to_owned(),
                 [] => "a name".to_owned(),
@@ -923,14 +936,17 @@ pub struct View {
     typing: Option<String>,
     /// What the last change came to: saved, or why not.
     said: Option<Result<String, String>>,
+    /// The agent the window shows, which `sonny opens` steps to.
+    shown: Option<String>,
 }
 
 impl View {
-    /// The file as it is; an unreadable or invalid one is refused, as
-    /// every other reader refuses it.
-    pub fn open() -> Result<Self, String> {
+    /// The file as it is, in the window of agent `shown`; an unreadable
+    /// or invalid one is refused, as every other reader refuses it.
+    pub fn open(shown: &str) -> Result<Self, String> {
         let path = agent_client::config::path().ok_or("HOME is not set")?;
         let mut view = Self::at(path);
+        view.shown = Some(shown.to_owned());
         view.values = view.read()?;
         Ok(view)
     }
@@ -948,6 +964,7 @@ impl View {
             picker: crate::list::Picker::new(rows, 0),
             typing: None,
             said: None,
+            shown: None,
         }
     }
 
@@ -1038,11 +1055,15 @@ impl View {
             return;
         }
         // The default first, then each value that is not the default
-        // written out.
-        let values: Vec<&str> = (setting.values.iter())
-            .copied()
-            .filter(|value| *value != setting.default)
-            .collect();
+        // written out: for what sonny opens, the folder, then the agent
+        // this window shows.
+        let values: Vec<&str> = match setting.key {
+            OPENS => self.shown.as_deref().into_iter().collect(),
+            _ => (setting.values.iter())
+                .copied()
+                .filter(|value| *value != setting.default)
+                .collect(),
+        };
         let now = match &self.values[at] {
             None => 0,
             Some(value) => (values.iter())
@@ -1143,10 +1164,15 @@ impl View {
             Some(value) => value.clone(),
             None => SETTINGS[at].default.to_owned(),
         };
-        // Values past this many columns are cut, so the labels line up.
+        // Values past this many columns are cut, so the labels line up; a
+        // default never is.
         const VALUE_MAX: usize = 16;
+        let most = |at: usize| VALUE_MAX.max(SETTINGS[at].default.width());
         let values_wide = (shown.iter())
-            .map(|(row, _)| value(self.listed[*row]).width().min(VALUE_MAX))
+            .map(|(row, _)| {
+                let at = self.listed[*row];
+                value(at).width().min(most(at))
+            })
             .max()
             .unwrap_or(0);
         let mut lines = Vec::new();
@@ -1164,7 +1190,7 @@ impl View {
             let typed = (i == pick).then_some(self.typing.as_ref()).flatten();
             let shown = match typed {
                 Some(typed) => typed.clone(),
-                None => crate::transcript::cut(&value(at), VALUE_MAX),
+                None => crate::transcript::cut(&value(at), most(at)),
             };
             let pad = " ".repeat(wide.saturating_sub(setting.name.width()));
             let gap = " ".repeat(values_wide.saturating_sub(shown.width()) + 2);
@@ -1449,7 +1475,7 @@ mod tests {
                 assert!(!setting.name.contains(['_', '.']), "{}", setting.name);
             }
         }
-        assert_eq!(listed().len(), 39);
+        assert_eq!(listed().len(), 40);
         // What only tunes stays in the file, and in the reference.
         for key in [
             "sonny.sky_haiku_daily",
@@ -1513,7 +1539,7 @@ mod tests {
             text(&rows)
         );
         // Down past the eighth row scrolls, the pick in view.
-        for _ in 0..9 {
+        for _ in 0..10 {
             press(&mut view, KeyCode::Down);
         }
         let rows = view.rows(100, 40);
@@ -1816,6 +1842,60 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "[sonny]\nbogus = \"x\"\n"
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_sonny_opens_steps_between_the_folder_and_the_agent_the_window_shows() {
+        let dir = std::env::temp_dir().join(format!("sonny-config-opens-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut view = View::at(path.clone());
+        view.shown = Some("work.lead".into());
+        view.values = view.read().unwrap();
+        find(&mut view, "sonny opens");
+        let opens = || agent_client::config::read(&path).unwrap().sonny.opens;
+        // The default, whole and muted.
+        let row = |view: &View| {
+            (view.rows(120, 20).iter())
+                .map(|line| line.to_string())
+                .find(|line| line.contains("sonny opens"))
+                .unwrap()
+        };
+        assert!(
+            row(&view).contains("this folder's lead  "),
+            "{}",
+            row(&view)
+        );
+        press(&mut view, KeyCode::Right);
+        assert_eq!(
+            opens(),
+            agent_client::config::Opens::Agent("work.lead".into())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[sonny]\nopens = \"work.lead\"\n"
+        );
+        assert!(row(&view).contains("work.lead"), "{}", row(&view));
+        // Back to the folder: the key taken out.
+        press(&mut view, KeyCode::Right);
+        assert_eq!(opens(), agent_client::config::Opens::Folder);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("opens"));
+        press(&mut view, KeyCode::Left);
+        assert_eq!(
+            opens(),
+            agent_client::config::Opens::Agent("work.lead".into())
+        );
+        // Another agent set in the file steps to this window's.
+        std::fs::write(&path, "[sonny]\nopens = \"other.lead\"\n").unwrap();
+        view.values = view.read().unwrap();
+        press(&mut view, KeyCode::Right);
+        assert_eq!(
+            opens(),
+            agent_client::config::Opens::Agent("work.lead".into())
+        );
+        assert!(skill().contains("| `sonny.opens` |"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

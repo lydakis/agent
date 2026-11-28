@@ -502,10 +502,12 @@ fn hand_off(index: usize) -> Result<bool, String> {
 pub const USAGE: &str = "\
 usage: sonny setup [--provider chatgpt|anthropic|openai|openrouter|bedrock]
                    [--profile AWS_PROFILE] [--key-stdin] [--model PROVIDER/MODEL]
-                   [--import-mcp [codex,claude,opencode,kiro]] [--browser-signed-in] [--json]
+                   [--opens folder|AGENT] [--import-mcp [codex,claude,opencode,kiro]]
+                   [--browser-signed-in] [--json]
 With no flags, asks in a terminal. With flags, sets what they name and asks
 nothing, for scripts and agents: --key-stdin reads the provider's key from
-stdin into ~/.agent/keys/env; --import-mcp brings the MCP servers of those agents
+stdin into ~/.agent/keys/env; --opens names what a bare sonny opens, the
+folder's lead or an agent by its whole name; --import-mcp brings the MCP servers of those agents
 (all, when it names none) but those from files in this folder;
 --browser-signed-in names the Default Chrome profile in agent-browser's own
 settings when they name none and Chrome has it; --json prints what this machine has and what
@@ -517,6 +519,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
     let mut profile = None;
     let mut key_stdin = false;
     let mut model = None;
+    let mut opens = None;
     let mut import = None;
     let mut json = false;
     let mut signed_in = false;
@@ -531,6 +534,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
             "--provider" => provider = Some(value("--provider")?),
             "--profile" => profile = Some(value("--profile")?),
             "--model" => model = Some(value("--model")?),
+            "--opens" => opens = Some(value("--opens")?),
             "--key-stdin" => key_stdin = true,
             "--json" => json = true,
             "--browser-signed-in" => signed_in = true,
@@ -641,6 +645,11 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
         }
         save(&config, Some(("model", model)))?;
     }
+    if let Some(opens) = &opens {
+        let value = (opens != "folder").then(|| toml::Value::String(opens.clone()));
+        // One every reader would refuse is refused, the file kept.
+        agent_client::config::write(&config, &[("sonny.opens", value)])?;
+    }
     // A setup by flags installs the browser and desktop programs as the
     // one that asks does, so agents can use them after either.
     if provider.is_some() || model.is_some() {
@@ -700,6 +709,7 @@ pub async fn flags(args: &[String], socket: &Path) -> Result<(), String> {
             let changed = [
                 provider.map(|p| format!("provider {p}")),
                 model.map(|m| format!("model {m}")),
+                opens.map(|o| format!("opens {o}")),
                 (!brought.is_empty()).then(|| format!("MCP {}", brought.join(", "))),
                 seeded.then(|| {
                     format!(
@@ -742,6 +752,10 @@ fn state(home: &Path) -> Result<Value, String> {
         "env": agent_client::env_file::path(),
         "provider": config.provider,
         "model": config.model,
+        "opens": match &config.sonny.opens {
+            agent_client::config::Opens::Agent(name) => name.as_str(),
+            agent_client::config::Opens::Folder => "folder",
+        },
         "ways": ways,
         "agents": AGENTS.iter().map(|(name, command, _)| {
             json!({"name": name, "command": command, "on_path": on_path(command)})
@@ -839,6 +853,7 @@ pub async fn model(client: &Client) -> Result<String, String> {
         break typed;
     };
     save(&file, Some(("model", &model)))?;
+    opens(client, &file).await?;
     // Servers the person's other agents reach, offered once a model can
     // use them; a refusal leaves setup done.
     crate::skills::note_offered("mcp-import");
@@ -867,6 +882,70 @@ pub async fn model(client: &Client) -> Result<String, String> {
     summary(&model, &file, &brought, backed);
     Ok(model)
 }
+
+/// Asks what a bare `sonny` opens, as the model is asked: this folder's
+/// lead, the default, or an agent from any folder, each lead on the
+/// daemon listed by its whole name and any other typed, there yet or not.
+/// The answer is kept as the config's `[sonny] opens`, the folder by no
+/// key at all.
+async fn opens(client: &Client, file: &Path) -> Result<(), String> {
+    let mut leads = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, next) = crate::project::every_lead(client, after.as_deref()).await?;
+        let page = page.into_iter().filter(crate::project::is_lead_record);
+        leads.extend(page.filter_map(|lead| {
+            let name = lead["name"].as_str()?.to_owned();
+            let at = lead["workspace"]
+                .as_str()
+                .map(crate::tilde)
+                .unwrap_or_default();
+            Some((name, at))
+        }));
+        match next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    let current = agent_client::config::read(file)?.sonny.opens;
+    let set = match &current {
+        agent_client::config::Opens::Agent(name) => Some(name.as_str()),
+        agent_client::config::Opens::Folder => None,
+    };
+    // One set that is no lead listed, a task or gone, is listed too.
+    if let Some(set) = set.filter(|set| !leads.iter().any(|(name, _)| name == set)) {
+        leads.insert(0, (set.to_owned(), String::new()));
+    }
+    let mut rows =
+        vec![Row::new(FOLDER, "where sonny runs; made there the first time").badge("default")];
+    rows.extend(leads.iter().map(|(name, at)| {
+        let row = Row::new(name, at);
+        match set == Some(name.as_str()) {
+            true => row.badge("current"),
+            false => row,
+        }
+    }));
+    let marked =
+        (set.and_then(|set| leads.iter().position(|(name, _)| name == set))).map_or(0, |at| at + 1);
+    println!(
+        "{DIM}What sonny opens when run alone; `sonny .` always opens the folder's lead.{RESET}"
+    );
+    let chosen = loop {
+        match picker::pick("Sonny opens", &rows, marked, true)? {
+            Picked::Row(0) => break None,
+            Picked::Row(index) => break Some(leads[index - 1].0.clone()),
+            Picked::Typed(text) if !text.contains(char::is_whitespace) => break Some(text),
+            Picked::Typed(text) => {
+                println!("{text} is not an agent's whole name, as work.lead is.")
+            }
+        }
+    };
+    let value = chosen.map(toml::Value::String);
+    agent_client::config::write(file, &[("sonny.opens", value)])
+}
+
+/// What the first row of what `sonny` opens says.
+const FOLDER: &str = "this folder's lead";
 
 /// Backup, offered once and last; an empty answer skips it.
 fn backup() -> Result<bool, String> {
@@ -999,10 +1078,15 @@ fn whole(text: &str) -> bool {
 fn summary(model: &str, file: &Path, brought: &[String], backed: bool) {
     let sonny = agent_client::config::read(file).map(|c| c.sonny).ok();
     let effort = |effort: Option<String>| effort.unwrap_or_else(|| "the model's own".into());
+    let opens = match sonny.as_ref().map(|s| &s.opens) {
+        Some(agent_client::config::Opens::Agent(name)) => name.clone(),
+        _ => FOLDER.to_owned(),
+    };
     let (lead, task) = sonny.map_or((None, None), |s| (s.lead_effort, s.task_effort));
     let file = crate::tilde(&file.display().to_string());
     println!("\n{BOLD}Sonny is set up.{RESET}");
     println!("  Model       {model}");
+    println!("  Opens       {opens}");
     println!(
         "  Effort      leads {}, tasks {}",
         effort(lead),
@@ -1179,6 +1263,8 @@ const TEMPLATE: &str = "\
 # lead_effort, task_effort   a new lead's and each new task's effort: low, medium,
 #                            high, xhigh, or max on Claude; unset, the model's own
 # chime = true               rings when work ends or waits; quiet by default
+# opens = \"work.lead\"        what a bare sonny opens: \"folder\", the default, the
+#                            folder's lead; or an agent by its whole name
 #
 # [reviewer]
 # model = \"PROVIDER/MODEL\"  who reviews calls in auto mode; unset, the agent's model
