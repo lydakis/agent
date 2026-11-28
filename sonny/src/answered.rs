@@ -190,29 +190,42 @@ impl Answered {
     }
 
     /// The questions whose answers may still be taken back unread: each
-    /// one's key, its task and the message its answer went as. They were
-    /// answered lately, so only the two newest files are read for them.
-    pub fn unsettled(&mut self) -> Vec<(String, String, i64)> {
-        let newest: Vec<i64> = self.files.iter().rev().take(2).copied().collect();
-        for at in newest {
-            self.entries(at);
-        }
-        (self.read.values().flatten())
-            .filter_map(|entry| match &entry.what {
-                What::Ask {
-                    ask,
-                    sent: Some(sent),
-                    ..
-                } => Some((ask.key(), ask.task.as_ref()?.bot.clone(), *sent)),
-                _ => None,
-            })
+    /// one's key, its task and the message its answer went as, from the
+    /// folder's list of them ([`PENDING`]), wherever in the history each
+    /// was drawn.
+    pub fn unsettled(&self) -> Vec<(String, String, i64)> {
+        (self.pending().into_iter())
+            .map(|(key, (bot, sent, _))| (key, bot, sent))
             .collect()
+    }
+
+    /// The answers that may still be taken back unread, by key: their
+    /// task, the message each went as and the file it is in.
+    fn pending(&self) -> BTreeMap<String, (String, i64, i64)> {
+        let listed = (self.dir.as_deref())
+            .and_then(|dir| std::fs::read(dir.join(PENDING)).ok())
+            .and_then(|json| serde_json::from_slice(&json).ok());
+        match listed {
+            Some(listed) => listed,
+            // Kept in memory only: the files read are all there is.
+            None if self.dir.is_none() => (self.read.iter())
+                .flat_map(|(at, entries)| entries.iter().map(move |entry| (*at, entry)))
+                .filter_map(|(at, entry)| Some((entry.key(), (pending(entry)?, at))))
+                .map(|(key, ((bot, sent), at))| (key, (bot, sent, at)))
+                .collect(),
+            None => BTreeMap::new(),
+        }
+    }
+
+    /// The file, read or listed as pending, that holds the answer at `key`.
+    fn found(&self, key: &str) -> Option<i64> {
+        (self.holding(key)).or_else(|| self.pending().get(key).map(|(_, _, at)| *at))
     }
 
     /// The answer to the question at `key` reached its task: nothing
     /// takes it back now.
     pub fn delivered(&mut self, key: &str) -> Result<(), String> {
-        let Some(at) = self.holding(key) else {
+        let Some(at) = self.found(key) else {
             return Ok(());
         };
         self.change(at, |entries| {
@@ -229,7 +242,7 @@ impl Answered {
     /// The answer to the question at `key` let go: it never reached the
     /// task, which took it back unread, so nothing was answered.
     pub fn forget(&mut self, key: &str) -> Result<(), String> {
-        let Some(at) = self.holding(key) else {
+        let Some(at) = self.found(key) else {
             return Ok(());
         };
         self.change(at, |entries| {
@@ -265,12 +278,47 @@ impl Answered {
             return Ok(());
         }
         let json = serde_json::to_vec(&*entries).map_err(|e| e.to_string())?;
-        let next = file.with_extension("json.next");
-        std::fs::write(&next, json).map_err(failed)?;
-        std::fs::rename(&next, &file).map_err(failed)?;
+        let waiting: Vec<(String, (String, i64))> = (entries.iter())
+            .filter_map(|entry| Some((entry.key(), pending(entry)?)))
+            .collect();
+        write(&file, &json).map_err(failed)?;
         self.files.insert(at);
-        Ok(())
+        // The list of answers that may still be taken back unread, as
+        // this file now has them.
+        let mut listed = self.pending();
+        let before = listed.len();
+        listed.retain(|_, (_, _, was)| *was != at);
+        let had = before - listed.len();
+        if had == 0 && waiting.is_empty() {
+            return Ok(());
+        }
+        listed.extend((waiting.into_iter()).map(|(key, (bot, sent))| (key, (bot, sent, at))));
+        let json = serde_json::to_vec(&listed).map_err(|e| e.to_string())?;
+        write(&dir.join(PENDING), &json).map_err(failed)
     }
+}
+
+/// The folder's list of answers that may still be taken back unread.
+const PENDING: &str = "pending.json";
+
+/// The task an answer went to and the message it went as, while it may
+/// still be taken back unread.
+fn pending(entry: &Entry) -> Option<(String, i64)> {
+    match &entry.what {
+        What::Ask {
+            ask,
+            sent: Some(sent),
+            ..
+        } => Some((ask.task.as_ref()?.bot.clone(), *sent)),
+        _ => None,
+    }
+}
+
+/// `json` written to `path` whole, through a file beside it.
+fn write(path: &Path, json: &[u8]) -> std::io::Result<()> {
+    let next = path.with_extension("json.next");
+    std::fs::write(&next, json)?;
+    std::fs::rename(&next, path)
 }
 
 fn dir(home: &Path, key: &str) -> PathBuf {
@@ -369,9 +417,24 @@ mod tests {
         here.keep(entry(5, "shop.fix", "t2/c1", "No")).unwrap();
         // Read again by the next window to open the agent, as it may still
         // be taken back unread.
-        let mut next = Answered::in_folder(dir.clone());
+        let next = Answered::in_folder(dir.clone());
         let unsettled = vec![("@shop.fix/t1/c1".to_owned(), "shop.fix".to_owned(), 7)];
         assert_eq!(next.unsettled(), unsettled);
+        // One drawn far back in the history is listed all the same, and a
+        // window that never read its file lets it go.
+        let mut old = entry(-5000, "shop.fix", "t0/c1", "Maybe");
+        if let What::Ask { sent, .. } = &mut old.what {
+            *sent = Some(2);
+        }
+        here.keep(old).unwrap();
+        let mut fresh = Answered::in_folder(dir.clone());
+        assert_eq!(fresh.unsettled().len(), 2);
+        fresh.forget("@shop.fix/t0/c1").unwrap();
+        assert_eq!(Answered::in_folder(dir.clone()).unsettled(), unsettled);
+        assert!(
+            (Answered::in_folder(dir.clone()).within(i64::MIN, 0)).is_empty(),
+            "taken out of its file"
+        );
         here.forget("@shop.fix/t1/c1").unwrap();
         here.delivered("@shop.fix/t2/c1").unwrap();
         assert!(Answered::in_folder(dir.clone()).unsettled().is_empty());
