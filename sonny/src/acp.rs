@@ -1344,9 +1344,13 @@ impl Session {
         // Each turn's calls so far, as the live follow counts them: each
         // ends a reply.
         let mut parts: HashMap<i64, HashSet<String>> = HashMap::new();
+        // The turn running at the live cursor, where the replay ends: one
+        // that ends after it ends in the events that follow.
+        let mut open = None;
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
             written = written.max(data["node"].as_i64());
+            open = turn_open(open, &event);
             if let Some(turn) = event["turn"].as_i64() {
                 match event["event"].as_str() {
                     Some("accepted") => {
@@ -1409,7 +1413,9 @@ impl Session {
             .map_err(|e| e.to_string())?;
         let bot_id = record["bot_id"].as_i64();
         let workspace = record["workspace"].as_str().unwrap_or_default().to_owned();
-        let running = record["running_turn"].as_i64();
+        // The turn the replay leaves running, as the events up to the live
+        // cursor say; the inspection's only when they say none.
+        let running = open.or(record["running_turn"].as_i64());
         let model = format!(
             "{}/{}",
             record["provider"].as_str().unwrap_or(""),
@@ -2989,7 +2995,7 @@ impl Session {
             workspace: &workspace,
             calls: HashMap::new(),
             parts: HashMap::new(),
-            replies: Vec::new(),
+            replies: VecDeque::new(),
         };
         let mut next = 0;
         while next < nodes.len() {
@@ -3055,9 +3061,10 @@ struct History<'a> {
     workspace: &'a str,
     calls: HashMap<String, (i64, String, Value)>,
     parts: HashMap<i64, u32>,
-    /// The bot's replies shown, oldest first, by id, node and first line:
-    /// a client may react to them as to live ones.
-    replies: Vec<(String, i64, String)>,
+    /// The bot's latest replies shown, at most [`REPLIES`], oldest first,
+    /// by id, node and first line: a client may react to them as to live
+    /// ones.
+    replies: VecDeque<(String, i64, String)>,
 }
 
 impl History<'_> {
@@ -3141,7 +3148,10 @@ impl History<'_> {
                     json!({"sessionUpdate": "agent_message",
                     "messageId": id, "content": [{"type": "text", "text": text}]}),
                 );
-                self.replies.push((id, node, first_line(&text)));
+                if self.replies.len() == REPLIES {
+                    self.replies.pop_front();
+                }
+                self.replies.push_back((id, node, first_line(&text)));
             }
             _ => {}
         }
@@ -3178,6 +3188,16 @@ fn lately(task: &Value, now: i64) -> bool {
         || task["last"]["finished_ms"]
             .as_i64()
             .is_some_and(|ended| now - ended <= LATELY_MS)
+}
+
+/// The turn running after `event`, a bot's, when `open` ran before it.
+fn turn_open(open: Option<i64>, event: &Value) -> Option<i64> {
+    let turn = event["turn"].as_i64();
+    match event["event"].as_str() {
+        Some("accepted") if turn.is_some() => turn,
+        Some("turn_finished") if turn == open => None,
+        _ => open,
+    }
 }
 
 /// The bots, by id, among those `glob` matches, with a message still in
@@ -5024,6 +5044,42 @@ mod tests {
             "its task is followed: {:?}",
             sessions.keys().collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn the_turn_running_at_the_live_cursor_is_the_events_own() {
+        let saw = |events: &[(&str, i64)]| {
+            (events.iter()).fold(None, |open, (kind, turn)| {
+                turn_open(open, &json!({"event": kind, "turn": turn}))
+            })
+        };
+        // Still running where the replay ends, whatever it is by the time
+        // the bot is inspected: its calls end in the events after.
+        assert_eq!(saw(&[("accepted", 3), ("tool_started", 3)]), Some(3));
+        assert_eq!(saw(&[("accepted", 3), ("turn_finished", 3)]), None);
+        // A steer's message ends no turn of its own.
+        assert_eq!(saw(&[("accepted", 3), ("turn_finished", 4)]), Some(3));
+    }
+
+    #[test]
+    fn a_replay_keeps_only_the_latest_replies_to_react_to() {
+        let agent = test_agent();
+        let mut history = History {
+            out: &agent.out,
+            session: "s1",
+            bot: "calc.lead",
+            workspace: "",
+            calls: HashMap::new(),
+            parts: HashMap::new(),
+            replies: VecDeque::new(),
+        };
+        let said = json!({"type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "ok"}]});
+        for turn in 0..(REPLIES as i64 + 5) {
+            history.item(turn, turn, &said, None);
+        }
+        assert_eq!(history.replies.len(), REPLIES);
+        assert_eq!(history.replies.front().map(|r| r.1), Some(5));
     }
 
     #[test]
