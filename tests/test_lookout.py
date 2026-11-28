@@ -384,9 +384,15 @@ class LookoutTests(ModelFixture):
                 break
             self.assertLess(time.monotonic(), deadline, held)
             time.sleep(.1)
-        log = [json.loads(line) for line in (self.path / 'state.sqlite.lookout.jsonl').read_text().splitlines()]
-        self.assertTrue(any(line.get('why') == 'its subscriber was closed' and line['lead'] == 'reviewer'
-                            for line in log), log)
+        # The lookout may be writing its log's next line as it is read:
+        # only whole lines count, until the one looked for is there.
+        while True:
+            written = (self.path / 'state.sqlite.lookout.jsonl').read_text()
+            log = [json.loads(line) for line in written[:written.rfind('\n') + 1].splitlines()]
+            if any(line.get('why') == 'its subscriber was closed' and line['lead'] == 'reviewer' for line in log):
+                break
+            self.assertLess(time.monotonic(), deadline, log)
+            time.sleep(.1)
         # What it followed no longer wakes it, and so never opens it again.
         self.daemon.request('submit', bot='ops.deploy', request_id='d', prompt='ship it')
         self.assertIsNone(self.note_for('reviewer', timeout=5))
