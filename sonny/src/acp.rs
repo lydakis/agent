@@ -1929,22 +1929,13 @@ impl Session {
         project::wrote_to(bound.client.store(), &bound.workspace, &bound.bot);
         state.sending += 1;
         drop(state);
-        let reply = client.request("submit", asked).await;
+        let reply = submit_again(&client, asked, key.is_some()).await;
         let mut state = self.state.lock().await;
         state.sending -= 1;
         let reply = match reply {
             Ok(reply) => reply,
-            // Sent again under its key, differing only in what Sonny chose
-            // for it (how it goes, the folder it moves to): it is the
-            // message the key sent first, as the daemon kept it.
             Err(error) if error.code == "idempotency_conflict" => {
-                let fact = |name| (error.facts.as_deref()).and_then(|facts| facts.get(name));
-                match (fact("field").and_then(Value::as_str), fact("message")) {
-                    (Some("delivery" | "workspace"), Some(message)) if key.is_some() => {
-                        json!({"message": message, "duplicate": true})
-                    }
-                    _ => return Err((INVALID_PARAMS, error.to_string())),
-                }
+                return Err((INVALID_PARAMS, error.to_string()));
             }
             Err(error) => return Err((FAILED, error.to_string())),
         };
@@ -3186,6 +3177,44 @@ fn lately(task: &Value, now: i64) -> bool {
         || task["last"]["finished_ms"]
             .as_i64()
             .is_some_and(|ended| now - ended <= LATELY_MS)
+}
+
+/// Submit `asked`; a keyed one sent again that differs from its first
+/// only in what Sonny chose for it, how it goes or the folder it moves to,
+/// goes again as the first went, so the daemon checks the rest and
+/// answers with the message the key sent. A retry naming no folder goes
+/// where the first went; a delivery is one of two.
+async fn submit_again(
+    client: &Client,
+    mut asked: Value,
+    keyed: bool,
+) -> Result<Value, agent_client::Error> {
+    for _ in 0..2 {
+        let error = match client.request("submit", asked.clone()).await {
+            Err(error) if keyed && error.code == "idempotency_conflict" => error,
+            other => return other,
+        };
+        let field = (error.facts.as_deref())
+            .and_then(|facts| facts.get("field"))
+            .and_then(Value::as_str);
+        match field {
+            Some("workspace") => {
+                if let Some(asked) = asked.as_object_mut() {
+                    asked.remove("workspace");
+                }
+            }
+            Some("delivery") => {
+                let other = if asked["delivery"] == "queue" {
+                    "steer"
+                } else {
+                    "queue"
+                };
+                asked["delivery"] = json!(other);
+            }
+            _ => return Err(error),
+        }
+    }
+    client.request("submit", asked).await
 }
 
 /// The turn running after `event`, a bot's, when `open` ran before it.
@@ -4916,24 +4945,32 @@ mod tests {
         let agent = test_agent();
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let seen = submitted.clone();
+        // As the daemon checks a key sent again against the first: field by
+        // field, the first that differs named; a folder not named is the
+        // first's.
         let client = crate::tests::daemon_answering(move |asked| {
             if asked["op"] != "submit" {
                 return json!({});
             }
             let mut sent = seen.lock().unwrap();
             sent.push(asked.clone());
-            // As the daemon answers a key sent again: another delivery, as
-            // after a resume that no longer moves the lead, or other words.
-            let field = if asked["prompt"] != "go" {
-                "prompt"
-            } else {
-                "delivery"
+            let Some(first) = sent.first().cloned() else {
+                return json!({});
             };
-            match sent.len() {
-                1 => json!({"message": 9}),
-                _ => json!({"error": "idempotency_conflict",
+            if sent.len() == 1 {
+                return json!({"message": 9, "duplicate": false});
+            }
+            let differs = ["prompt", "workspace", "delivery", "person"]
+                .into_iter()
+                .find(|field| {
+                    let named = !asked[*field].is_null() || *field != "workspace";
+                    named && asked[*field] != first[*field]
+                });
+            match differs {
+                Some(field) => json!({"error": "idempotency_conflict",
                     "detail": format!("{field} differs from the request that sent message 9"),
                     "field": field, "message": 9}),
+                None => json!({"message": 9, "duplicate": true}),
             }
         })
         .await;
@@ -4946,23 +4983,31 @@ mod tests {
         let first = session.prompt(&agent, &params).await.unwrap();
         assert_eq!(first["messageId"], "calc.lead/9");
         assert_eq!(submitted.lock().unwrap()[0]["delivery"], "queue");
-        // Lost on the way and sent again: the same message, shown once.
         let shown = |agent: &Agent| {
             (updates(&written(agent)).into_iter())
                 .filter(|(_, u)| u["sessionUpdate"] == "user_message")
                 .count()
         };
         assert_eq!(shown(&agent), 1);
+        // Lost on the way and sent again where the lead no longer moves,
+        // as after a resume: the same message, shown once.
+        if let Some(bound) = &mut session.state.lock().await.bound {
+            bound.moving = None;
+        }
         let again = session.prompt(&agent, &params).await.unwrap();
         assert_eq!(again["messageId"], "calc.lead/9");
         assert_eq!(shown(&agent), 0);
-        // Other words under the same key are another request.
+        // Sent again by someone else, or with other words: another request.
+        let ana = json!({"sessionId": "s1", "idempotencyKey": "k1",
+            "prompt": [{"type": "text", "text": "go"}], "_meta": {"person": "ana"}});
         let other = json!({"sessionId": "s1", "idempotencyKey": "k1",
             "prompt": [{"type": "text", "text": "stop"}]});
-        assert_eq!(
-            session.prompt(&agent, &other).await.err().map(|e| e.0),
-            Some(INVALID_PARAMS)
-        );
+        for refused in [ana, other] {
+            assert_eq!(
+                session.prompt(&agent, &refused).await.err().map(|e| e.0),
+                Some(INVALID_PARAMS)
+            );
+        }
     }
 
     #[tokio::test]
