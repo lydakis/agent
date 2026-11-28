@@ -108,10 +108,17 @@ struct Out {
 
 impl Out {
     /// Send `message`, or keep it while its session's history replays.
+    /// A task's session is kept with its lead's, in the order sent, so a
+    /// subagent is announced before anything comes under its id.
     fn send(&self, message: Value) {
         if let Some(session) = message["params"]["sessionId"].as_str()
             && let Ok(mut held) = self.held.lock()
-            && let Some(kept) = held.get_mut(session)
+            && let Some(kept) = (held.iter_mut())
+                .find(|(lead, _)| {
+                    session == lead.as_str()
+                        || (session.strip_prefix(lead.as_str())).is_some_and(|r| r.starts_with('/'))
+                })
+                .map(|(_, kept)| kept)
         {
             kept.push(message);
             return;
@@ -882,13 +889,29 @@ struct Session {
 
 impl Session {
     /// Stop following the bot, and take back what was asked for it.
-    fn stop(&self, out: &Out) {
+    fn stop(self: &Arc<Self>, out: &Arc<Out>) {
         if let Some(follower) = self.follower.lock().ok().and_then(|mut f| f.take()) {
             follower.abort();
         }
-        if let Ok(mut state) = self.state.try_lock() {
+        let withdraw = |state: &mut State| {
             for (request, _) in state.asking.drain() {
                 out.withdraw(request);
+            }
+        };
+        match self.state.try_lock() {
+            Ok(mut state) => withdraw(&mut state),
+            // The follower holds it until its abort lands: what it asked
+            // is taken back once it lets go.
+            Err(_) => {
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    let (session, out) = (self.clone(), out.clone());
+                    runtime.spawn(async move {
+                        let mut state = session.state.lock().await;
+                        for (request, _) in state.asking.drain() {
+                            out.withdraw(request);
+                        }
+                    });
+                }
             }
         }
     }
@@ -943,8 +966,13 @@ struct State {
     /// Prompts being sent, and whether the person stopped one meanwhile.
     sending: usize,
     cancelled: bool,
-    /// The messages this session sent, which it showed when it sent them.
+    /// Messages shown already whose other sighting is still to come: one
+    /// this session sent and showed, until its turn takes it in or it
+    /// ends in line.
     sent: HashSet<i64>,
+    /// Messages a turn took in while prompts were being sent, shown
+    /// then: the prompt whose answer names one does not show it again.
+    early: HashSet<i64>,
     /// The state last reported, as `state_update` has it.
     reported: Option<Value>,
     /// The model and effort the person picked, which the bot takes when
@@ -970,6 +998,18 @@ struct State {
 const REPLIES: usize = 64;
 
 impl State {
+    /// Whether message `message`, which a turn took in, is still to be
+    /// shown: not when this session showed it as it sent it.
+    fn unseen(&mut self, message: i64) -> bool {
+        if self.sent.remove(&message) {
+            return false;
+        }
+        if self.sending > 0 {
+            self.early.insert(message);
+        }
+        true
+    }
+
     /// Take back what this session asked the person about `call`, whose
     /// gate is decided: whether it asked anything.
     fn settle_asks(&mut self, out: &Out, call: &(Option<i64>, String)) -> bool {
@@ -1249,9 +1289,21 @@ impl Session {
         // newest node the events before the live cursor name is where the
         // replay ends and the live follow takes over.
         let mut written = None;
+        // Each turn's replies so far, as the live follow numbers them: one
+        // more with each call it started.
+        let mut parts: HashMap<i64, u32> = HashMap::new();
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
             written = written.max(data["node"].as_i64());
+            if let Some(turn) = event["turn"].as_i64() {
+                match event["event"].as_str() {
+                    Some("accepted") => {
+                        parts.insert(turn, 0);
+                    }
+                    Some("tool_started") => *parts.entry(turn).or_default() += 1,
+                    _ => {}
+                }
+            }
             let call = (
                 event["turn"].as_i64(),
                 data["call_id"].as_str().unwrap_or("").to_owned(),
@@ -1348,6 +1400,9 @@ impl Session {
                 state.agent = None;
             }
             state.running = running;
+            state.part = running
+                .and_then(|turn| parts.get(&turn).copied())
+                .unwrap_or(0);
             state.calls = calls;
             state.lifted = lifted;
             state.gated = gated;
@@ -1837,11 +1892,20 @@ impl Session {
         }
         let inserted = user_id(&bot, message);
         // Shown already when its turn took it before the daemon answered.
-        let fresh = message.is_none_or(|message| state.sent.insert(message));
-        if fresh && let Some(message) = message {
-            state.queued.insert(message);
+        let fresh = message.is_none_or(|message| !state.early.remove(&message));
+        if state.sending == 0 {
+            // No prompt in flight is left to name the others.
+            state.early.clear();
         }
-        if fresh && reply["duplicate"] != true {
+        let duplicate = reply["duplicate"] == true;
+        if fresh
+            && !duplicate
+            && let Some(message) = message
+        {
+            state.queued.insert(message);
+            state.sent.insert(message);
+        }
+        if fresh && !duplicate {
             agent.out.update(
                 &self.id,
                 json!({"sessionUpdate": "user_message", "messageId": inserted, "content": shown}),
@@ -2135,7 +2199,7 @@ impl Session {
                 // Shown once: a prompt of this session's, whose answer is
                 // still on its way, is not shown again.
                 if let Some(message) = turn
-                    && state.sent.insert(message)
+                    && state.unseen(message)
                     && let Some(node) = data["node"].as_i64()
                 {
                     self.show_message(out, &client, &bot, message, node, data)
@@ -2150,7 +2214,7 @@ impl Session {
                 // from another window: the thread's next message too.
                 if data["attached"] != true
                     && let Some(message) = data["message"].as_i64()
-                    && state.sent.insert(message)
+                    && state.unseen(message)
                     && let Some(node) = data["node"].as_i64()
                 {
                     self.show_message(out, &client, &bot, message, node, data)
@@ -2464,8 +2528,7 @@ impl Session {
                 if let Some(ended) = ended {
                     state.queued.remove(&ended);
                 }
-                if ended.is_some_and(|ended| state.sent.contains(&ended)) && state.running.is_none()
-                {
+                if ended.is_some_and(|ended| state.sent.remove(&ended)) && state.running.is_none() {
                     let mut now = state.snapshot(&self.children());
                     match data["status"].as_str() {
                         Some("withdrawn") => now["stopReason"] = json!("cancelled"),
@@ -4625,6 +4688,50 @@ mod tests {
             end["background"],
             json!([{"type": "tool_call", "toolCallId": "7/c1"}])
         );
+    }
+
+    #[test]
+    fn a_held_lead_holds_its_tasks_sessions_in_the_order_sent() {
+        let agent = test_agent();
+        agent.out.hold("s1");
+        agent
+            .out
+            .update("s1", json!({"sessionUpdate": "subagent_update"}));
+        agent
+            .out
+            .update("s1/t#1", json!({"sessionUpdate": "session_message"}));
+        agent
+            .out
+            .update("s10", json!({"sessionUpdate": "agent_message"}));
+        let order = |written: Vec<Value>| -> Vec<String> {
+            (updates(&written).into_iter())
+                .map(|(session, _)| session)
+                .collect()
+        };
+        // Another session whose id only begins the same goes on.
+        assert_eq!(order(written(&agent)), ["s10"]);
+        agent.out.release("s1");
+        assert_eq!(order(written(&agent)), ["s1", "s1/t#1"]);
+    }
+
+    #[test]
+    fn a_message_is_kept_only_until_its_other_sighting() {
+        let mut state = State::default();
+        // Sent and shown here, then taken in by a turn: shown once, and
+        // nothing is kept after.
+        state.sent.insert(5);
+        assert!(!state.unseen(5));
+        assert!(state.sent.is_empty() && state.early.is_empty());
+        // Taken in while a prompt is on its way: kept for that prompt's
+        // answer to find.
+        state.sending = 1;
+        assert!(state.unseen(6));
+        assert!(state.early.contains(&6));
+        // From elsewhere with nothing on its way: shown, nothing kept.
+        state.sending = 0;
+        state.early.clear();
+        assert!(state.unseen(7));
+        assert!(state.early.is_empty());
     }
 
     #[tokio::test]
