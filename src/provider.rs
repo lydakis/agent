@@ -2732,6 +2732,39 @@ pub(crate) fn quota(code: &str) -> bool {
     )
 }
 
+/// A failed response's error code that says the request itself cannot be
+/// served, so asking again gets the same answer: Codex's terminal provider
+/// errors (openai/codex 2026-11-28, `parse_terminal_provider_error` in
+/// codex-api/src/error.rs) that no code of ours names already. Any other
+/// failed response is the provider's and is retried, as Codex retries it.
+pub(crate) fn terminal(code: &str) -> bool {
+    matches!(
+        code,
+        "credit_balance_exhausted"
+            | "usage_not_included"
+            | "invalid_prompt"
+            | "misalignment_policy_violation"
+            | "api_key_spend_limit_exceeded"
+            | "project_spend_limit_exceeded"
+            | "organization_spend_limit_exceeded"
+            | "inference_hook_denied"
+            | "invalid_access_program"
+            | "unsupported_access_program"
+            | "content_policy_violation"
+            | "bio_policy"
+            | "access_program_not_enabled"
+            | "budget_reached"
+            | "audio_too_large"
+            | "audio_too_short"
+            | "invalid_audio"
+            | "invalid_audio_data"
+            | "invalid_audio_format"
+            | "missing_audio_sample_rate"
+            | "flex_unavailable"
+            | "model_not_found"
+    )
+}
+
 /// The namespace a ChatGPT plan request groups the bot's tools under.
 const PLAN_NAMESPACE: &str = "agent";
 

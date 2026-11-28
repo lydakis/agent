@@ -611,6 +611,12 @@ class Model(http.server.BaseHTTPRequestHandler):
                 events = [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {
                     'code': 'context_length_exceeded',
                     'message': 'Your input exceeds the context window of this model.'}}}]
+            if user.startswith('streamfailed:') and attempt == 1:
+                # The provider fails the response midway for a cause of its
+                # own, with a code no client knows.
+                events = [{'type': 'response.output_text.delta', 'delta': 'partial'},
+                          {'type': 'response.failed', 'response': {'status': 'failed', 'error': {
+                              'code': 'service_unavailable', 'message': 'The service is temporarily unavailable.'}}}]
             if user.startswith('streamlimit-flat:') and attempt == 1:
                 events = [{'type': 'error', 'code': 'rate_limit_exceeded',
                            'message': 'Please try again in 300ms.', 'param': None, 'sequence_number': 1}]
@@ -4160,18 +4166,19 @@ class RuntimeTests(ModelFixture):
         for prompt, code in (('flaky:1', 'provider_http_503'), ('limited:1', 'provider_http_429'),
                              ('streamlimit:1', 'provider_rate_limited'),
                              ('streamlimit-flat:1', 'provider_rate_limited'),
+                             ('streamfailed:1', 'provider_response_failed'),
                              ('origin:1', 'provider_http_520')):
             with self.subTest(prompt=prompt):
                 data, retries = run(prompt)
                 self.assertEqual(data['status'], 'completed', data)
                 self.assertEqual([(r['data']['attempt'], r['data']['error']) for r in retries], [(1, code)])
         turns = client.request('turns', bot='Bob')['result']['turns']
-        self.assertEqual([t['retries'] for t in turns], [1, 1, 1, 1, 1])
+        self.assertEqual([t['retries'] for t in turns], [1, 1, 1, 1, 1, 1])
         # Each retry stays in the bot's events, for whoever reads them later.
         kept = client.request('events', bot='Bob', after=0, limit=256)['result']['events']
         self.assertEqual([e['data']['error'] for e in kept if e['event'] == 'retry'],
                          ['provider_http_503', 'provider_http_429', 'provider_rate_limited',
-                          'provider_rate_limited', 'provider_http_520'])
+                          'provider_rate_limited', 'provider_response_failed', 'provider_http_520'])
         # The retry waited for the pool's Retry-After, then for the delay
         # named in the stream, which a top-level error names the same way.
         # Each is timed here from the refused attempt's arrival, before the
