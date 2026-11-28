@@ -182,12 +182,9 @@ impl Out {
         }
     }
 
-    /// Ask the client now, to wait on its answer later: questions put
-    /// together reach it in the order they were put.
-    fn asking(&self, method: &str, params: Value) -> oneshot::Receiver<Value> {
-        let (id, answer) = self.reserve();
-        self.request(id, method, params);
-        answer
+    /// Whether request `id` still waits on the client's answer.
+    fn waits(&self, id: i64) -> bool {
+        self.waiting.lock().is_ok_and(|w| w.contains_key(&id))
     }
 
     /// An id for a request to the client, and where its answer comes.
@@ -915,6 +912,9 @@ impl Session {
             for (request, _) in state.asking.drain() {
                 out.withdraw(request);
             }
+            for form in state.forms.drain().filter(|form| out.waits(*form)) {
+                out.withdraw(form);
+            }
         };
         match self.state.try_lock() {
             Ok(mut state) => withdraw(&mut state),
@@ -927,6 +927,9 @@ impl Session {
                         let mut state = session.state.lock().await;
                         for (request, _) in state.asking.drain() {
                             out.withdraw(request);
+                        }
+                        for form in state.forms.drain().filter(|form| out.waits(*form)) {
+                            out.withdraw(form);
                         }
                     });
                 }
@@ -955,6 +958,9 @@ struct State {
     /// The running turn's calls so far, each of which ends a reply: the
     /// bot's words after one are its next.
     parted: HashSet<String>,
+    /// The forms put to the person here, by request: those still open are
+    /// taken back when the session stops.
+    forms: HashSet<i64>,
     /// The words of this part sent as they streamed.
     streamed: String,
     /// The calls shown running, by turn and call: a later turn may use a
@@ -1022,6 +1028,15 @@ struct State {
 const REPLIES: usize = 64;
 
 impl State {
+    /// Put a form to the person, as one of this session's.
+    fn form(&mut self, out: &Out, params: Value) -> oneshot::Receiver<Value> {
+        self.forms.retain(|id| out.waits(*id));
+        let (id, answer) = out.reserve();
+        self.forms.insert(id);
+        out.request(id, "elicitation/create", params);
+        answer
+    }
+
     /// Call `call` of `turn` was announced: started, lifted or ended,
     /// denied ones too. Of the running turn, the bot's next words are a
     /// reply of their own, as a replay counts the turn's calls.
@@ -1702,7 +1717,9 @@ impl Session {
         if value == DEFAULT || value == bound.bot {
             return Ok(());
         }
-        if state.running.is_some() || state.sending > 0 {
+        // Nor while a message sent here waits in line: its work is this
+        // lead's to show and to stop.
+        if state.running.is_some() || state.sending > 0 || !state.queued.is_empty() {
             return Err((
                 INVALID_PARAMS,
                 format!("{} is answering; pick another lead once it has", bound.bot),
@@ -2484,7 +2501,7 @@ impl Session {
                     && !ask.options.is_empty()
                     && state.asked.insert(ask.id.clone())
                 {
-                    let asked = out.asking("elicitation/create", form(id, &ask, Some(&shown_call)));
+                    let asked = state.form(out, form(id, &ask, Some(&shown_call)));
                     let lead = (bot, state.bound.as_ref().and_then(|b| b.bot_id));
                     let (agent, session) = (agent.clone(), self.id.clone());
                     tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
@@ -2750,14 +2767,14 @@ impl Session {
     /// newest first, as far back as every surface reads it.
     async fn questions(&self, agent: &Arc<Agent>, client: &Arc<Client>, bot: &str) {
         for ask in open_asks(client, bot).await {
-            let bot_id = {
+            let (asked, bot_id) = {
                 let mut state = self.state.lock().await;
                 if !state.asked.insert(ask.id.clone()) {
                     continue;
                 }
-                state.bound.as_ref().and_then(|b| b.bot_id)
+                let bot_id = state.bound.as_ref().and_then(|b| b.bot_id);
+                (state.form(&agent.out, form(&self.id, &ask, None)), bot_id)
             };
-            let asked = (agent.out).asking("elicitation/create", form(&self.id, &ask, None));
             let (agent, session, lead) = (agent.clone(), self.id.clone(), (bot.to_owned(), bot_id));
             tokio::spawn(async move { elicit(asked, &agent, &session, lead, &ask).await });
         }
@@ -4870,6 +4887,23 @@ mod tests {
         agent.out.withdraw(id);
         agent.out.release("s1");
         assert_eq!(written(&agent), Vec::<Value>::new());
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_takes_back_its_open_forms() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|_| json!({})).await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        let _answer = session
+            .state
+            .lock()
+            .await
+            .form(&agent.out, json!({"sessionId": "s1"}));
+        written(&agent);
+        session.stop(&agent.out);
+        let said = written(&agent);
+        assert!(said.iter().any(|m| m["method"] == "$/cancel_request"));
+        assert!(session.state.lock().await.forms.is_empty());
     }
 
     #[tokio::test]
