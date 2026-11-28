@@ -128,6 +128,79 @@ class BlindTests(unittest.TestCase):
             [blind] = list((out / 'blind').iterdir())
             self.assertIn('## Titles the lead set\n\n- halves: Round half cents to even', blind.read_text())
 
+    def test_a_version_2_transcript_is_the_leads_session_as_the_person_sees_it(self):
+        # ACP version 2: a call starts with its first `tool_call_update`,
+        # the person's own prompt shows as a `user_message` with the id the
+        # prompt was answered with, and a task's work is in its own
+        # subagent session.
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            update = lambda session, u: {'t': 0, 'm': {'method': 'session/update',
+                                                      'params': {'sessionId': session, 'update': u}}}
+            rows = [{'t': 0, 'sent': {'method': 'session/prompt',
+                                      'params': {'sessionId': 's1', 'prompt': [{'text': 'Fix it'}]}}},
+                    update('s1', {'sessionUpdate': 'user_message', 'messageId': 'shop.lead/4',
+                                  'content': [{'type': 'text', 'text': 'Fix it'}]}),
+                    {'t': 0, 'm': {'id': 3, 'result': {'messageId': 'shop.lead/4'}}},
+                    update('s1', {'sessionUpdate': 'tool_call_update', 'toolCallId': '5/c1', 'name': 'start_task',
+                                  'status': 'in_progress', 'rawInput': {'name': 'halves', 'brief': 'Round'}}),
+                    update('s1', {'sessionUpdate': 'tool_call_update', 'toolCallId': '5/c1', 'name': 'start_task',
+                                  'status': 'completed', 'rawInput': {'name': 'halves', 'brief': 'Round'}}),
+                    update('shop.halves#9@ab', {'sessionUpdate': 'agent_message_chunk', 'messageId': 't1',
+                                                'content': {'type': 'text', 'text': 'Task words.'}}),
+                    update('shop.halves#9@ab', {'sessionUpdate': 'user_message', 'messageId': 'shop.halves/2',
+                                                'content': [{'type': 'text', 'text': 'A note to the task.'}]}),
+                    update('s1', {'sessionUpdate': 'agent_message_chunk', 'messageId': 'm1',
+                                  'content': {'type': 'text', 'text': 'Started it.'}}),
+                    update('s1', {'sessionUpdate': 'user_message', 'messageId': 'shop.lead/6',
+                                  'content': [{'type': 'text', 'text': 'halves finished'}]})]
+            (run / 'acp.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            role_eval.transcript(run)
+            parts = json.loads((run / 'transcript.json').read_text())
+            self.assertEqual([(p['kind'], p['start'], [c['name'] for c in p['calls']], list(p['said'].values()))
+                              for p in parts],
+                             [('person', 'Fix it', ['start_task'], ['Started it.']),
+                              ('note', 'halves finished', [], [])])
+
+    def test_a_version_2_prompt_is_done_when_its_work_ends(self):
+        # Answered once its message is in, the prompt is done when its
+        # session's work ends after showing its message, as that end says;
+        # an earlier turn's end, or a task's, is not it.
+        with tempfile.TemporaryDirectory() as tmp:
+            sonny = Path(tmp) / 'sonny'
+            sonny.write_text(
+                '#!/usr/bin/env python3\nimport json, sys, time\n'
+                'def say(m):\n    print(json.dumps(m), flush=True)\n'
+                'def end(session, **more):\n'
+                '    say({"method": "session/update", "params": {"sessionId": session, "update": {'
+                '"sessionUpdate": "state_update", "state": "idle", "background": [], **more}}})\n'
+                'for line in sys.stdin:\n'
+                '    rid = json.loads(line)["id"]\n'
+                '    end("s1", stopReason="end_turn")\n'
+                '    say({"method": "session/update", "params": {"sessionId": "s1", "update": {'
+                '"sessionUpdate": "user_message", "messageId": "shop.lead/1", "content": []}}})\n'
+                '    say({"id": rid, "result": {"messageId": "shop.lead/1"}})\n'
+                '    time.sleep(.5)\n'
+                '    end("task", stopReason="end_turn")\n'
+                '    time.sleep(.5)\n'
+                '    end("s1", stopReason="error", error={"message": "rate limited"})\n')
+            sonny.chmod(0o755)
+            acp = role_eval.Acp(sonny, dict(os.environ), tmp, Path(tmp) / 'acp.jsonl', tmp)
+            try:
+                sent = time.time()
+                rid = acp.ask('session/prompt', {'sessionId': 's1'}, wait=False)
+                done = acp.collect(rid, timeout=10)
+                self.assertEqual(done['result'], {'messageId': 'shop.lead/1', 'stopReason': 'error',
+                                                  'error': {'message': 'rate limited'}})
+                self.assertGreaterEqual(acp.at[rid] - sent, 1)
+            finally:
+                acp.close()
+
+    def test_a_call_waiting_on_the_person_is_read_from_its_subject(self):
+        home = Path('/tmp/run-home')
+        call = {'name': 'shell', 'rawInput': {'command': '~/.agent/automation ls'}}
+        self.assertTrue(role_eval.determinable(home, {'subject': {'type': 'tool_call', 'toolCall': call}}))
+
     def test_every_planted_quiet_step_is_scored(self):
         rubric = (Path(__file__).resolve().parents[1] / 'docs/ROLE_EVAL.md').read_text()
         plants = [word for s in role_eval.QUIET for word in (s.get('plant') or '').split()[:3]

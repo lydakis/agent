@@ -521,9 +521,12 @@ class View:
         log = self.out / 'acp.jsonl'
         rows = [json.loads(line) for line in open(log)] if log.exists() else []
         prompts = [i for i, r in enumerate(rows) if (r.get('sent') or {}).get('method') == 'session/prompt']
+        sessions = role_eval.lead_sessions(rows)
         said = ''
         for row in rows[prompts[-1] + 1:] if prompts else []:
-            u = ((row.get('m') or {}).get('params') or {}).get('update') or {}
+            if not role_eval.seen_by_person(row.get('m') or {}, sessions):
+                continue
+            u = row['m']['params']['update']
             if u.get('sessionUpdate') == 'agent_message_chunk':
                 said += (u.get('content') or {}).get('text', '')
                 if re.search(pattern, said, re.I):
@@ -606,16 +609,18 @@ class View:
         """The arguments of the lead's calls of `name` that completed, as
         `sonny acp` reported each call's end: a denied or failed call did
         nothing."""
-        calls, ended = {}, {}
+        calls, ended, started = {}, {}, set()
         log = self.out / 'acp.jsonl'
-        for line in open(log) if log.exists() else []:
-            m = json.loads(line).get('m') or {}
-            if m.get('method') != 'session/update':
+        rows = [json.loads(line) for line in open(log)] if log.exists() else []
+        sessions = role_eval.lead_sessions(rows)
+        for row in rows:
+            m = row.get('m') or {}
+            if not role_eval.seen_by_person(m, sessions):
                 continue
             u = m['params']['update']
-            if u.get('sessionUpdate') == 'tool_call' and u.get('name') == name:
+            if role_eval.call_started(u, started) and u.get('name') == name:
                 calls[u['toolCallId']] = u.get('rawInput')
-            elif u.get('sessionUpdate') == 'tool_call_update' and u.get('status'):
+            if u.get('sessionUpdate') == 'tool_call_update' and u.get('status'):
                 ended[u.get('toolCallId')] = u['status']
         return [args for call, args in calls.items() if ended.get(call) == 'completed']
 
