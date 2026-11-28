@@ -16215,9 +16215,19 @@ impl App {
                     }
                     Some(version) => compaction_named(&socket, version).await,
                 };
-                // What Sonny puts after the instructions it composes,
-                // read from the agent's folder here, beside the window.
-                let ends = context::ends(record["workspace"].as_str());
+                // What Sonny puts after the instructions it composes, read
+                // here, beside the window: from the agent's folder, and
+                // from its starter's, where a task's role is read from.
+                let starter = match record["created_by"].as_str() {
+                    Some(by) => (client.request("inspect", json!({"bot": by})).await.ok())
+                        .and_then(|starter| starter["workspace"].as_str().map(str::to_owned)),
+                    None => None,
+                };
+                let folders: Vec<&str> = [record["workspace"].as_str(), starter.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                let ends = context::ends(&folders);
                 let mut parts = context::Parts::from_record(&record, &ends);
                 parts.compacted = compacted;
                 Ok(parts)

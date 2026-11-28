@@ -61,19 +61,24 @@ pub struct Piece {
 
 /// What Sonny puts after the instructions it composes, each with what it
 /// is called: a lead's task rule, a workflow worker's rules, and the task
-/// role of the project of `workspace`, the agent's folder.
-pub fn ends(workspace: Option<&str>) -> Vec<(&'static str, String)> {
+/// role of the project of each of `folders`: the agent's own and the one
+/// of the agent that started it, where a task's role is read from, as its
+/// worktree may not hold the lead's uncommitted roles.
+pub fn ends(folders: &[&str]) -> Vec<(&'static str, String)> {
     let mut ends = vec![
         ("Task rule", agent_client::project::tasks_rule(false)),
         ("Task rule", agent_client::project::tasks_rule(true)),
         ("Workflow", crate::workflow::told_text().to_owned()),
     ];
-    let dir = workspace.map(std::path::Path::new);
-    let told = dir.and_then(|dir| {
-        let info = crate::project::read(dir).ok()?;
-        crate::project::as_task(dir, &info, "").ok()
-    });
-    ends.extend(told.map(|told| ("Task role", told)));
+    for dir in folders.iter().map(std::path::Path::new) {
+        let told =
+            crate::project::read(dir).and_then(|info| crate::project::as_task(dir, &info, ""));
+        if let Ok(told) = told
+            && !ends.iter().any(|(_, end)| *end == told)
+        {
+            ends.push(("Task role", told));
+        }
+    }
     ends
 }
 
@@ -581,7 +586,7 @@ mod tests {
             "You lead. ".repeat(200),
         );
         let record = json!({"instructions": instructions, "tools": [], "declared": []});
-        let mut parts = Parts::from_record(&record, &ends(None));
+        let mut parts = Parts::from_record(&record, &ends(&[]));
         (parts.used, parts.window) = (Some(20_000), Some(200_000));
         let shown = text(&card("shop.lead", &parts, 100));
         let at = (shown.iter())
@@ -618,10 +623,34 @@ mod tests {
         let given = json!({"instructions": "You review.", "tools": [], "declared": []});
         let shown = text(&card(
             "shop.check",
-            &Parts::from_record(&given, &ends(None)),
+            &Parts::from_record(&given, &ends(&[])),
             100,
         ));
         assert!(!shown.iter().any(|row| row.contains("└")), "{shown:?}");
+    }
+
+    #[test]
+    fn a_tasks_role_is_found_in_the_folder_of_the_agent_that_started_it() {
+        let root = std::env::temp_dir().join(format!("sonny-context-ends-{}", std::process::id()));
+        let (lead, worktree) = (root.join("shop"), root.join("worktree"));
+        std::fs::create_dir_all(lead.join(".agents/agents")).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        // The lead's own task role, not committed, so not in the worktree.
+        std::fs::write(
+            lead.join(".agents/agents/task.md"),
+            "---\nname: task\n---\nShip small changes.",
+        )
+        .unwrap();
+        let instructions = format!("{}\n\nShip small changes.", agent_client::policy::PREAMBLE);
+        let record = json!({"instructions": instructions, "tools": [], "declared": []});
+        let (lead, worktree) = (lead.to_str().unwrap(), worktree.to_str().unwrap());
+        let last = |folders: &[&str]| {
+            let parts = Parts::from_record(&record, &ends(folders));
+            parts.pieces.last().map(|piece| piece.label)
+        };
+        assert_eq!(last(&[worktree]), Some("Preamble"));
+        assert_eq!(last(&[worktree, lead]), Some("Task role"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
