@@ -114,6 +114,8 @@ The commons tool carries it all:
     from a live holder too, saying why.
   - `pause` keeps open or waiting work you made, or any as the project's lead,
     from being taken until you `open` it again: for work not ready yet.
+    Its text says what the work waits on; the work shows it, with who
+    paused it and when, until it opens.
   - `fail` on work you made that nobody holds cancels it; `open` opens
     failed or canceled work again.
   - `open` with `board` makes a thread already in the commons work on
@@ -168,6 +170,11 @@ commit. Work that needs it shows them to its taker, so it can merge or
 diff that branch. If you cannot finish, `fail` with why,
 or `drop` it for another agent if someone else could. Ask in its thread
 when you are stuck; its other agents read it.
+
+When work waits on something, such as a pull request merging, a deploy
+or a date, `pause` it saying what it waits on, follow that thing with
+your follows tool (or, for a date, an automation `at` it), and `open`
+the work when it comes. Work that won't be done is `fail`, not `pause`.
 
 A lead with a board's worth of work starts one task with `board` and
 `agents`: a list of entries, each a `count` of agents with a `model`, a

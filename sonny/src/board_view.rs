@@ -115,6 +115,12 @@ pub struct Item {
     pub at: i64,
     /// When its holder last wrote in it, in seconds.
     pub holder_at: Option<i64>,
+    /// Who paused paused work, by its own name.
+    pub paused_by: Option<String>,
+    /// When it was paused, in seconds.
+    pub paused_at: Option<i64>,
+    /// What its pause post said: what the work waits on.
+    pub paused_why: Option<String>,
 }
 
 /// The item a thread's listing line says, if it is one: `summary` as the
@@ -146,6 +152,9 @@ pub fn item_of(summary: &Value, at: i64) -> Option<Item> {
         result: text(&item["result"]),
         at,
         holder_at: item["holder_at"].as_i64(),
+        paused_by: text(&item["paused_by"]),
+        paused_at: item["paused_at"].as_i64(),
+        paused_why: text(&item["paused_why"]),
     })
 }
 
@@ -315,13 +324,19 @@ fn kept_words(item: &Item, present: &Present) -> Option<String> {
 }
 
 /// An item's state in words, with its holder where it has one: `open`,
-/// `taken by errors-2`, `errors-2 closed`.
+/// `taken by errors-2`, `errors-2 closed`, `paused by lead`.
 pub fn state_words(item: &Item, here: &str, present: &Present) -> String {
     match (&item.holder, item.state) {
         (Some(holder), State::Taken) if present.closed(holder) => {
             format!("{} closed", named(holder, here))
         }
         (Some(holder), State::Taken) => format!("taken by {}", named(holder, here)),
+        (_, State::Paused) if item.paused_by.is_some() => {
+            format!(
+                "paused by {}",
+                named(item.paused_by.as_deref().unwrap_or_default(), here)
+            )
+        }
         (_, state) => state.word().to_owned(),
     }
 }
@@ -447,6 +462,20 @@ pub fn page_row(
                 let said = named(holder, here);
                 (said.clone(), said.clone(), Some((said, holder.clone())))
             }
+            // Paused work says who paused it, as taken work its holder.
+            (_, State::Paused) if item.paused_by.is_some() => {
+                let by = item.paused_by.clone().unwrap_or_default();
+                match present.closed(&by) {
+                    true => {
+                        let said = format!("{} closed", named(&by, here));
+                        (said.clone(), said, None)
+                    }
+                    false => {
+                        let said = named(&by, here);
+                        (said.clone(), said.clone(), Some((said, by)))
+                    }
+                }
+            }
             (_, State::Open | State::Waiting | State::Paused) => match kept_words(item, present) {
                 Some(kept) => {
                     let short = match present.nobody_for(item) {
@@ -459,9 +488,11 @@ pub fn page_row(
             },
             _ => (String::new(), String::new(), None),
         };
-    // Taken work shows when its holder last wrote there.
+    // Taken work shows when its holder last wrote there, paused work
+    // since when it was paused.
     let at = match item.state {
         State::Taken => item.holder_at.unwrap_or(item.at),
+        State::Paused => item.paused_at.unwrap_or(item.at),
         _ => item.at,
     };
     let age = age(now - at);
@@ -572,7 +603,8 @@ pub fn plain_row(
 
 /// What hangs under an item's row on its board's page, if anything: what
 /// a waiting item needs, by title, then `+N`; why a failed one failed;
-/// a done one's result's first line.
+/// a done one's result's first line; what a paused one waits on, as its
+/// pause said.
 pub fn page_detail(
     item: &Item,
     others: &HashMap<&str, &Item>,
@@ -597,6 +629,7 @@ pub fn page_detail(
             }
         }
         State::Failed | State::Done => crate::status::plain_line(item.result.as_deref()?),
+        State::Paused => crate::status::plain_line(item.paused_why.as_deref()?),
         _ => return None,
     };
     if said.trim().is_empty() {
@@ -728,6 +761,22 @@ pub fn item_head(
                 Some(Target::Agent(holder.clone())),
             ),
         ]),
+        (_, State::Paused) if item.paused_by.is_some() => {
+            let by = item.paused_by.clone().unwrap_or_default();
+            parts.push(vec![
+                (Span::raw("paused by ").dim(), None),
+                match present.closed(&by) {
+                    true => (
+                        Span::raw(format!("{} closed", named(&by, here))).dim(),
+                        None,
+                    ),
+                    false => (
+                        Span::raw(named(&by, here)).fg(Color::Blue),
+                        Some(Target::Agent(by.clone())),
+                    ),
+                },
+            ]);
+        }
         (_, state) => parts.push(vec![(Span::raw(state.word()).dim(), None)]),
     }
     if let Some(kept) = kept_words(item, present) {
@@ -1584,6 +1633,73 @@ pub(crate) mod tests {
         view.reload();
         let lines = card(&mut view, 80);
         assert!(lines.iter().any(|l| l.contains("shop/notes")), "{lines:#?}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn paused_work_shows_who_paused_it_since_when_and_what_it_waits_on() {
+        let home = &home("paused-why");
+        add(
+            home,
+            "shop.lead",
+            "shop/x",
+            "store",
+            "Type the store",
+            json!({}),
+        );
+        act(
+            home,
+            "shop.lead",
+            "store",
+            "pause",
+            "Waits on PR #12 merging\n\nThen rebase.",
+        );
+        age_by(home, "store", 3 * 3600);
+        // A label set later is the work's last post, not its pause.
+        send(
+            home,
+            "shop.lead",
+            json!({"reply": {"thread": "store", "labels": {"area": "db"}}}),
+        );
+        let summary = (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+            .find(|(name, _)| name == "store")
+            .map(|(_, summary)| summary)
+            .unwrap();
+        let item = item_of(&summary, summary["at"].as_i64().unwrap()).unwrap();
+        assert_eq!(item.state, State::Paused);
+        let now = item.at;
+        let (row, named) = page_row(&item, 80, now, "shop", &Present::default());
+        assert!(text(&row).ends_with("lead · 3h"), "{row:?}");
+        // Who paused it is a link to that agent, as a holder is.
+        assert_eq!(named.map(|(_, _, bot)| bot).as_deref(), Some("shop.lead"));
+        // What it waits on hangs under it, its first line.
+        let detail = page_detail(&item, &HashMap::new(), 80).unwrap();
+        assert_eq!(text(&detail), "   └ Waits on PR #12 merging");
+        // The item's own page says who paused it.
+        let present = Present::default();
+        assert_eq!(state_words(&item, "shop", &present), "paused by lead");
+        let (rows, links) = item_head(&item, "shop", &present, 80);
+        assert!(
+            text(&rows[0]).starts_with("work on shop/x · paused by lead"),
+            "{rows:?}"
+        );
+        assert!(
+            links
+                .iter()
+                .any(|(_, _, _, t)| *t == Target::Agent("shop.lead".into()))
+        );
+        // Opened again, it is open work with none of it.
+        act(home, "shop.lead", "store", "open", "PR #12 merged");
+        let summary = (crate::commons::summaries(&crate::commons::dir(home)).into_iter())
+            .find(|(name, _)| name == "store")
+            .map(|(_, summary)| summary)
+            .unwrap();
+        let item = item_of(&summary, summary["at"].as_i64().unwrap()).unwrap();
+        assert_eq!(item.state, State::Open);
+        assert_eq!(
+            (item.paused_by, item.paused_at, item.paused_why),
+            (None, None, None)
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 
