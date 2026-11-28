@@ -2804,7 +2804,7 @@ impl Session {
         // waiting for room: they run once the daemon takes it in.
         let waiting = match project {
             Some(project) => in_line(client, &format!("{}.*", glob_literal(project))).await,
-            None => HashSet::new(),
+            None => InLine::default(),
         };
         let now = now_ms();
         for task in &tasks {
@@ -2813,7 +2813,7 @@ impl Session {
             };
             let queued = task["bot_id"]
                 .as_i64()
-                .is_some_and(|id| waiting.contains(&id));
+                .is_some_and(|id| waiting.bots.contains(&id));
             if !queued && !lately(task, now) {
                 continue;
             }
@@ -2906,15 +2906,13 @@ impl Session {
         if !registered {
             return;
         }
+        // What it was sent that is still in line, its brief or a later
+        // message, is the subagent's to take back on cancel.
+        let waiting = in_line(client, task).await;
+        session.state.lock().await.queued.extend(waiting.messages);
         // Its brief, the first message it was sent, as the lead's to it.
-        if let Some((first, brief, waiting)) = brief(client, task).await {
-            let mut state = session.state.lock().await;
-            state.sent.insert(first);
-            // One in line is the subagent's to take back on cancel.
-            if waiting {
-                state.queued.insert(first);
-            }
-            drop(state);
+        if let Some((first, brief)) = brief(client, task).await {
+            session.state.lock().await.sent.insert(first);
             out.update(
                 &child,
                 json!({"sessionUpdate": "session_message", "messageId": user_id(task, Some(first)),
@@ -3200,21 +3198,30 @@ fn turn_open(open: Option<i64>, event: &Value) -> Option<i64> {
     }
 }
 
-/// The bots, by id, among those `glob` matches, with a message still in
-/// line: queued, or ready to run once the daemon has room.
-async fn in_line(client: &Client, glob: &str) -> HashSet<i64> {
-    let mut bots = HashSet::new();
+/// The messages still in line, queued or ready to run once the daemon
+/// has room, and the bots they wait for, by id.
+#[derive(Default)]
+struct InLine {
+    messages: HashSet<i64>,
+    bots: HashSet<i64>,
+}
+
+/// The messages still in line for `bots`, a bot's name or a GLOB pattern.
+async fn in_line(client: &Client, bots: &str) -> InLine {
+    let mut found = InLine::default();
     let mut after = 0;
     loop {
-        let asked = json!({"bot": glob, "after": after, "limit": 256, "waiting": true});
+        let asked = json!({"bot": bots, "after": after, "limit": 256, "waiting": true});
         let Ok(page) = client.request("messages", asked).await else {
-            return bots;
+            return found;
         };
-        let rows = page["messages"].as_array().into_iter().flatten();
-        bots.extend(rows.filter_map(|row| row["bot_id"].as_i64()));
+        for row in page["messages"].as_array().into_iter().flatten() {
+            found.messages.extend(row["message"].as_i64());
+            found.bots.extend(row["bot_id"].as_i64());
+        }
         match page["next_after"].as_i64() {
             Some(next) => after = next,
-            None => return bots,
+            None => return found,
         }
     }
 }
@@ -3663,7 +3670,7 @@ async fn open_task(
             .request("inspect", json!({"bot": bot}))
             .await
             .map_err(|e| e.to_string())?;
-        let (_, brief, _) = brief(client, &bot).await.ok_or("the task has no brief")?;
+        let (_, brief) = brief(client, &bot).await.ok_or("the task has no brief")?;
         let workspace = record["workspace"].as_str().unwrap_or_default();
         let message = t3::expect(&bot, &brief, at.thread)?;
         let child = json!({"task": message, "title": name, "clientRequestId": bot});
@@ -4065,26 +4072,17 @@ fn quoted_path(path: &str) -> String {
 
 /// A task's brief, the first message it was sent, by its number: whether
 /// or not a turn has taken it in yet, as a task may wait for room.
-async fn brief(client: &Client, bot: &str) -> Option<(i64, String, bool)> {
+async fn brief(client: &Client, bot: &str) -> Option<(i64, String)> {
     let messages = client
         .request("messages", json!({"bot": bot, "after": 0, "limit": 1}))
         .await
         .ok()?;
     let first = messages["messages"][0]["message"].as_i64()?;
-    // Still in line, as when the daemon has no room for it yet.
-    let waiting = matches!(
-        messages["messages"][0]["status"].as_str(),
-        Some("queued" | "ready")
-    );
     let prompts = client
         .request("prompts", json!({"bot": bot, "turn": first}))
         .await
         .ok()?;
-    Some((
-        first,
-        prompts["prompts"][0]["text"].as_str()?.to_owned(),
-        waiting,
-    ))
+    Some((first, prompts["prompts"][0]["text"].as_str()?.to_owned()))
 }
 
 fn text_content(text: &str) -> Value {
@@ -5006,31 +5004,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_brief_still_in_line_says_so() {
-        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
-            Some("messages") => json!({"messages": [{"message": 4, "status": "queued"}]}),
-            _ => json!({"prompts": [{"text": "Fix it"}]}),
-        })
-        .await;
-        assert_eq!(
-            brief(&client, "calc.fix").await,
-            Some((4, "Fix it".into(), true))
-        );
-    }
-
-    #[tokio::test]
     async fn a_resumed_lead_adopts_a_task_whose_brief_waits_in_line() {
         let agent = test_agent();
         let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
             Some("bots") => json!({"bots": [{"name": "calc.fix", "bot_id": 9,
                 "created_by": "calc.lead", "running_turn": null, "last": null}],
                 "next_after": null}),
-            Some("messages") if asked["waiting"] == true => {
-                assert_eq!(asked["bot"], "calc.*");
-                json!({"messages": [{"bot": "calc.fix", "bot_id": 9, "message": 4,
-                    "status": "queued"}], "next_after": null})
-            }
-            Some("messages") => json!({"messages": [{"message": 4, "status": "queued"}]}),
+            // The project's tasks, then the task's own: its brief ran, and
+            // the lead's next message waits for room.
+            Some("messages") if asked["waiting"] == true => match asked["bot"].as_str() {
+                Some("calc.*" | "calc.fix") => json!({"messages": [{"bot": "calc.fix",
+                        "bot_id": 9, "message": 6, "status": "queued"}], "next_after": null}),
+                _ => json!({"messages": [], "next_after": null}),
+            },
+            Some("messages") => json!({"messages": [{"message": 4, "status": "completed"}]}),
             Some("prompts") => json!({"prompts": [{"text": "Fix it"}]}),
             Some("inspect") => json!({"name": "calc.fix", "bot_id": 9, "workspace": "/w"}),
             _ => json!({}),
@@ -5038,12 +5025,15 @@ mod tests {
         .await;
         let session = bound_session(&agent, "s1", client.clone(), "calc.lead", None);
         session.adopt_tasks(&agent, &client, 3).await;
-        let sessions = agent.sessions.lock().unwrap();
-        assert!(
-            sessions.keys().any(|id| id.starts_with("s1/")),
-            "its task is followed: {:?}",
-            sessions.keys().collect::<Vec<_>>()
-        );
+        let child = {
+            let sessions = agent.sessions.lock().unwrap();
+            let child = sessions.iter().find(|(id, _)| id.starts_with("s1/"));
+            child
+                .map(|(_, child)| child.clone())
+                .expect("its task is followed")
+        };
+        // What waits in line is the subagent's to take back on cancel.
+        assert!(child.state.lock().await.queued.contains(&6));
     }
 
     #[test]
