@@ -2356,7 +2356,19 @@ impl Session {
                     true if !state.lifted.remove(&key) => return,
                     _ => {}
                 }
-                let Some((name, arguments)) = state.calls.remove(&key) else {
+                // One denied at its gate never started: it ends here, as a
+                // replay or a client that saw it ask shows it.
+                let unstarted = !lifted && !state.calls.contains_key(&key);
+                let ended = match (state.calls.remove(&key), gated) {
+                    (Some(known), _) => Some(known),
+                    (None, Some(node)) if unstarted && data["denied"] == true => {
+                        planned_call(&client, &bot, node, &call)
+                            .await
+                            .filter(|(name, _)| name != reactions::TOOL && name != plan::TOOL)
+                    }
+                    _ => None,
+                };
+                let Some((name, arguments)) = ended else {
                     if lifted {
                         self.report(agent, &mut state);
                     }
@@ -2400,11 +2412,14 @@ impl Session {
                     workspace: &workspace,
                 };
                 let content = ended_content(out, id, &ran, true);
-                out.update(
-                    id,
-                    json!({"sessionUpdate": "tool_call_update", "toolCallId": shown_call,
-                    "status": status, "content": content}),
-                );
+                let mut update = match unstarted {
+                    // Named in full: the client may know it from nowhere else.
+                    true => tool_call(&shown_call, &name, &arguments, status),
+                    false => json!({"sessionUpdate": "tool_call_update",
+                        "toolCallId": shown_call, "status": status}),
+                };
+                update["content"] = json!(content);
+                out.update(id, update);
                 if lifted {
                     self.report(agent, &mut state);
                 }
@@ -3712,7 +3727,11 @@ fn ended_content(out: &Out, session: &str, ran: &Ran<'_>, now: bool) -> Vec<Valu
         if cwd.is_absolute() {
             terminal["cwd"] = json!(cwd);
         }
-        out.update(session, terminal);
+        // A replayed one goes with the replay, ahead of what is held.
+        match now {
+            true => out.update(session, terminal),
+            false => out.replayed(session, terminal),
+        }
         return vec![json!({"type": "terminal", "terminalId": ran.call})];
     }
     if !ran.failed
@@ -4688,6 +4707,37 @@ mod tests {
             end["background"],
             json!([{"type": "tool_call", "toolCallId": "7/c1"}])
         );
+    }
+
+    #[tokio::test]
+    async fn a_call_denied_at_its_gate_ends_failed() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|asked| {
+            let item = match asked["nodes"][0].as_i64() {
+                Some(4) => json!({"type": "function_call", "call_id": "c1", "name": "shell",
+                    "arguments": "{\"command\":\"rm -rf build\"}"}),
+                _ => json!({"type": "function_call_output", "call_id": "c1",
+                    "output": "{\"error\":\"denied\"}"}),
+            };
+            json!({"items": [{"node": asked["nodes"][0], "item": item}]})
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        {
+            let mut state = session.state.lock().await;
+            state.running = Some(7);
+            state.gated.insert((Some(7), "c1".into()), 4);
+        }
+        let denied = json!({"call_id": "c1", "node": 5, "denied": true});
+        session
+            .on(&agent, &event("tool_completed", "calc.lead", 7, denied))
+            .await;
+        let ended = (updates(&written(&agent)).into_iter())
+            .map(|(_, u)| u)
+            .find(|u| u["toolCallId"] == "7/c1")
+            .expect("the call ends");
+        assert_eq!(ended["status"], "failed");
+        assert_eq!(ended["title"], "rm -rf build");
     }
 
     #[test]
