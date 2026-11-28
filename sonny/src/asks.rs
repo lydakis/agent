@@ -266,6 +266,10 @@ pub fn turn_of(id: &str) -> Option<i64> {
     id.strip_prefix("ask:")?.split_once('/')?.0.parse().ok()
 }
 
+/// What every answer's `request_id` starts with: a message sent under one
+/// is the person's answer to a question.
+pub const ANSWER: &str = "answer-";
+
 /// The `request_id` the person's answer to ask `id` goes with on its
 /// `attempt`th sending, from 0: the same from every window and on every
 /// resend, so the daemon takes one answer to an ask and refuses another
@@ -277,8 +281,8 @@ pub fn request_id(id: &str, attempt: u32) -> String {
     let digest = Sha256::digest(id.as_bytes());
     let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
     match attempt {
-        0 => format!("answer-{hex}"),
-        attempt => format!("answer-{hex}.{attempt}"),
+        0 => format!("{ANSWER}{hex}"),
+        attempt => format!("{ANSWER}{hex}.{attempt}"),
     }
 }
 

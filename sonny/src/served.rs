@@ -418,10 +418,11 @@ fn follows() -> Value {
                             "description": "Sources it hears, by name, or NAME:TOPIC for one topic of it."},
                         "filter": {"type": "object",
                             "description": "Only events this matches are heard, from sources and agents alike. \
-                                A task's event has type (wrote, turn.ended, question, approval, margin), bot, \
+                                A task's event has type (wrote, turn.ended, question, approval, margin, \
+                                answered: a question an agent below it asked was answered), bot, \
                                 maker, from, turn, text, status (completed, failed, stopped, interrupted), done, \
-                                asked_by (you, the person, an agent, automation), options, command, call, id and \
-                                removed. An AWS EventBridge event pattern: each field a list of values, any \
+                                asked_by (you, the person, an agent, automation), options, command, call, id, \
+                                removed and asker. An AWS EventBridge event pattern: each field a list of values, any \
                                 matching, or a pattern for an object field; all must match, a list field when \
                                 any item does. Values are strings, numbers, booleans, null or the \
                                 matchers prefix, suffix, wildcard, equals-ignore-case, anything-but, numeric, \
