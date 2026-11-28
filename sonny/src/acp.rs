@@ -1001,9 +1001,6 @@ struct State {
     /// Messages a turn took in while prompts were being sent, shown
     /// then: the prompt whose answer names one does not show it again.
     early: HashSet<i64>,
-    /// The keyed prompt that moved the lead, and where: sent again, it
-    /// goes as it went.
-    moved_by: Option<(String, String)>,
     /// The state last reported, as `state_update` has it.
     reported: Option<Value>,
     /// The model and effort the person picked, which the bot takes when
@@ -1915,11 +1912,7 @@ impl Session {
             Some(key) => keyed(key),
             None => crate::unique("acp"),
         };
-        let moving = match &state.moved_by {
-            Some((by, dir)) if *by == request => Some(dir),
-            _ => (!steer).then_some(bound.moving.as_ref()).flatten(),
-        }
-        .cloned();
+        let moving = (!steer).then_some(bound.moving.clone()).flatten();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
             "request_id": request,
             "prompt": text,
@@ -1941,20 +1934,26 @@ impl Session {
         state.sending -= 1;
         let reply = match reply {
             Ok(reply) => reply,
+            // Sent again under its key, differing only in what Sonny chose
+            // for it (how it goes, the folder it moves to): it is the
+            // message the key sent first, as the daemon kept it.
             Err(error) if error.code == "idempotency_conflict" => {
-                return Err((INVALID_PARAMS, error.to_string()));
+                let fact = |name| (error.facts.as_deref()).and_then(|facts| facts.get(name));
+                match (fact("field").and_then(Value::as_str), fact("message")) {
+                    (Some("delivery" | "workspace"), Some(message)) if key.is_some() => {
+                        json!({"message": message, "duplicate": true})
+                    }
+                    _ => return Err((INVALID_PARAMS, error.to_string())),
+                }
             }
             Err(error) => return Err((FAILED, error.to_string())),
         };
+        // Moved by this message: the next goes where it went.
         if let Some(bound) = &mut state.bound
-            && !steer
+            && moving.is_some()
+            && reply["duplicate"] != true
         {
             bound.moving = None;
-        }
-        if let Some(dir) = moving
-            && key.is_some()
-        {
-            state.moved_by = Some((request, dir));
         }
         let message = reply["message"].as_i64();
         // Stopped while it was being sent: it is in, so it is answered,
@@ -4913,16 +4912,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_keyed_prompt_sent_again_goes_as_it_first_went() {
+    async fn a_keyed_prompt_sent_again_is_the_message_it_first_sent() {
         let agent = test_agent();
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let seen = submitted.clone();
         let client = crate::tests::daemon_answering(move |asked| {
-            if asked["op"] == "submit" {
-                seen.lock().unwrap().push(asked.clone());
-                return json!({"message": 9});
+            if asked["op"] != "submit" {
+                return json!({});
             }
-            json!({})
+            let mut sent = seen.lock().unwrap();
+            sent.push(asked.clone());
+            // As the daemon answers a key sent again: another delivery, as
+            // after a resume that no longer moves the lead, or other words.
+            let field = if asked["prompt"] != "go" {
+                "prompt"
+            } else {
+                "delivery"
+            };
+            match sent.len() {
+                1 => json!({"message": 9}),
+                _ => json!({"error": "idempotency_conflict",
+                    "detail": format!("{field} differs from the request that sent message 9"),
+                    "field": field, "message": 9}),
+            }
         })
         .await;
         let session = bound_session(&agent, "s1", client, "calc.lead", None);
@@ -4931,17 +4943,26 @@ mod tests {
         }
         let params = json!({"sessionId": "s1", "idempotencyKey": "k1",
             "prompt": [{"type": "text", "text": "go"}]});
-        for _ in 0..2 {
-            let answer = session.prompt(&agent, &params).await.unwrap();
-            assert_eq!(answer["messageId"], "calc.lead/9");
-        }
-        let sent = submitted.lock().unwrap();
-        let how: Vec<Value> = (sent.iter())
-            .map(|s| json!([s["delivery"], s["workspace"]]))
-            .collect();
-        assert_eq!(how.len(), 2);
-        assert_eq!(how[0], how[1]);
-        assert_eq!(how[0][0], "queue");
+        let first = session.prompt(&agent, &params).await.unwrap();
+        assert_eq!(first["messageId"], "calc.lead/9");
+        assert_eq!(submitted.lock().unwrap()[0]["delivery"], "queue");
+        // Lost on the way and sent again: the same message, shown once.
+        let shown = |agent: &Agent| {
+            (updates(&written(agent)).into_iter())
+                .filter(|(_, u)| u["sessionUpdate"] == "user_message")
+                .count()
+        };
+        assert_eq!(shown(&agent), 1);
+        let again = session.prompt(&agent, &params).await.unwrap();
+        assert_eq!(again["messageId"], "calc.lead/9");
+        assert_eq!(shown(&agent), 0);
+        // Other words under the same key are another request.
+        let other = json!({"sessionId": "s1", "idempotencyKey": "k1",
+            "prompt": [{"type": "text", "text": "stop"}]});
+        assert_eq!(
+            session.prompt(&agent, &other).await.err().map(|e| e.0),
+            Some(INVALID_PARAMS)
+        );
     }
 
     #[tokio::test]
