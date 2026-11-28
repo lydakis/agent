@@ -1341,28 +1341,28 @@ impl Session {
         // newest node the events before the live cursor name is where the
         // replay ends and the live follow takes over.
         let mut written = None;
-        // Each turn's calls so far, as the live follow counts them: each
-        // ends a reply.
-        let mut parts: HashMap<i64, HashSet<String>> = HashMap::new();
         // The turn running at the live cursor, where the replay ends: one
         // that ends after it ends in the events that follow.
         let mut open = None;
+        // That turn's calls so far, as the live follow counts them: each
+        // ends a reply. An ended turn's are not kept.
+        let mut parts: HashSet<String> = HashSet::new();
         let cursor = live(&mut events, |event| {
             let data = &event["data"];
             written = written.max(data["node"].as_i64());
+            let was = open;
             open = turn_open(open, &event);
-            if let Some(turn) = event["turn"].as_i64() {
-                match event["event"].as_str() {
-                    Some("accepted") => {
-                        parts.insert(turn, HashSet::new());
-                    }
-                    Some("tool_started" | "tool_completed" | "call_lifted") => {
-                        if let Some(call) = data["call_id"].as_str() {
-                            parts.entry(turn).or_default().insert(call.to_owned());
-                        }
-                    }
-                    _ => {}
-                }
+            if open != was {
+                parts.clear();
+            }
+            if let (Some(turn), Some(call)) = (event["turn"].as_i64(), data["call_id"].as_str())
+                && open == Some(turn)
+                && matches!(
+                    event["event"].as_str(),
+                    Some("tool_started" | "tool_completed" | "call_lifted")
+                )
+            {
+                parts.insert(call.to_owned());
             }
             let call = (
                 event["turn"].as_i64(),
@@ -1462,9 +1462,10 @@ impl Session {
                 state.agent = None;
             }
             state.running = running;
-            state.parted = running
-                .and_then(|turn| parts.remove(&turn))
-                .unwrap_or_default();
+            state.parted = match running == open {
+                true => parts,
+                false => HashSet::new(),
+            };
             state.part = state.parted.len() as u32;
             state.calls = calls;
             state.lifted = lifted;
