@@ -3087,7 +3087,28 @@ pub struct View {
     /// Whether boards are on (`crate::board::on`): off, the list is as it
     /// was before boards, an item's thread a thread like any.
     boards_on: bool,
+    /// When the folder's first read was asked for, until it comes: the
+    /// list says it is reading, with no count before it is read.
+    unread: Option<std::time::Instant>,
 }
+
+/// What a read of the commons folder found, made beside the window
+/// ([`View::reader`]) and taken in on it ([`View::read_came`]).
+pub struct Read {
+    listed: Result<Value, String>,
+    known: Summaries,
+    sent: Vec<Value>,
+    /// Each open thread's posts, read again where its file changed.
+    posts: Vec<PostsRead>,
+}
+
+/// An open thread's page, by name: its file's stamp, and its posts when
+/// the file changed since they were read.
+type PostsRead = (
+    String,
+    Option<crate::kept::Stamp>,
+    Option<Result<Vec<Value>, String>>,
+);
 
 /// A row the pick lands on, by what it is.
 #[derive(Clone, Debug, PartialEq)]
@@ -3169,8 +3190,19 @@ pub struct Card {
 }
 
 impl View {
+    /// The view, its folder read now (the window reads it beside its loop).
+    #[cfg(test)]
     pub fn open(home: &Path, project: String) -> Self {
-        let mut view = Self {
+        let mut view = Self::unread(home, project);
+        view.reload();
+        view
+    }
+
+    /// The view on `home`'s commons for `project`, its folder not read
+    /// yet: read beside the window ([`View::reader`]), it says it is
+    /// reading until then.
+    pub fn unread(home: &Path, project: String) -> Self {
+        Self {
             dir: dir(home),
             project,
             this: false,
@@ -3189,9 +3221,8 @@ impl View {
             present: crate::board_view::Present::default(),
             notice: None,
             boards_on: crate::board::on(),
-        };
-        view.reload();
-        view
+            unread: Some(std::time::Instant::now()),
+        }
     }
 
     /// The agents this window's project lists now, as its count knows
@@ -3202,11 +3233,58 @@ impl View {
 
     /// Read it all again: each thread only once it changed, the pick kept
     /// on what it was on.
+    #[cfg(test)]
     pub fn reload(&mut self) {
-        // The invites file is read once for the budget and the golden
-        // tickets both.
-        let sent = sent(&self.dir);
-        match list(&self.dir, 0, usize::MAX, &mut self.known, &sent, None) {
+        let read = self.reader()();
+        self.read_came(read);
+    }
+
+    /// The folder's read, to run beside the window: the listing, from
+    /// what the last read kept of each thread, and each open thread's
+    /// posts where its file changed.
+    pub fn reader(&mut self) -> impl FnOnce() -> Read + Send + 'static {
+        let dir = self.dir.clone();
+        let mut known = std::mem::take(&mut self.known);
+        let pages: Vec<(String, Option<crate::kept::Stamp>)> = (self.pages.iter())
+            .filter_map(|page| match page {
+                Page::Thread { name, stamp, .. } => Some((name.clone(), *stamp)),
+                Page::Board { .. } => None,
+            })
+            .collect();
+        move || {
+            // The invites file is read once for the budget and the golden
+            // tickets both.
+            let sent = sent(&dir);
+            let listed = list(&dir, 0, usize::MAX, &mut known, &sent, None);
+            let posts = (pages.into_iter())
+                .map(|(name, stamp)| {
+                    // Read again only once it changed.
+                    let path = dir.join(format!("{name}.jsonl"));
+                    let now = crate::kept::stamp(&path);
+                    let posts = (now.is_none() || now != stamp).then(|| self::posts(&path));
+                    (name, now, posts)
+                })
+                .collect();
+            Read {
+                listed,
+                known,
+                sent,
+                posts,
+            }
+        }
+    }
+
+    /// What [`View::reader`] read, taken in.
+    pub fn read_came(&mut self, read: Read) {
+        let Read {
+            listed,
+            known,
+            sent,
+            posts: read_posts,
+        } = read;
+        self.known = known;
+        self.unread = None;
+        match listed {
             Ok(listed) => {
                 self.threads = listed["threads"].as_array().cloned().unwrap_or_default();
                 self.invites = listed["invites"].clone();
@@ -3244,21 +3322,20 @@ impl View {
             .collect();
         self.boards = crate::board_view::boards(&self.items, &plain, &self.project);
         self.settle();
-        for page in &mut self.pages {
-            let Page::Thread {
-                name, posts, stamp, ..
-            } = page
-            else {
+        for (read, now, read_posts) in read_posts {
+            let Some(read_posts) = read_posts else {
                 continue;
             };
-            // Read again only once it changed.
-            let path = self.dir.join(format!("{name}.jsonl"));
-            let now = crate::kept::stamp(&path);
-            if now.is_some() && now == *stamp {
-                continue;
+            for page in &mut self.pages {
+                if let Page::Thread {
+                    name, posts, stamp, ..
+                } = page
+                    && *name == read
+                {
+                    *stamp = now;
+                    *posts = read_posts.clone();
+                }
             }
-            *stamp = now;
-            *posts = self::posts(&path);
         }
     }
 
@@ -3960,6 +4037,24 @@ impl View {
     }
 
     fn list_card(&self, width: usize) -> Card {
+        // Before its first read: whose it is, and the sign under it.
+        if let Some(since) = self.unread {
+            let whose = match self.this {
+                true => self.project.clone(),
+                false => "every project".to_owned(),
+            };
+            return Card {
+                lines: vec![
+                    Line::from(Span::raw(whose).bold()),
+                    Line::default(),
+                    crate::reading::line(since),
+                ],
+                at: 0,
+                starts: Vec::new(),
+                agents: Vec::new(),
+                links: Vec::new(),
+            };
+        }
         let rows = self.rows();
         let now = Self::now();
         let (open, _) = self.boards_split();
