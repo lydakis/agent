@@ -685,7 +685,15 @@ impl Agent {
         }
         if resumed.is_some() {
             if replay {
-                session.replay(&self.out).await;
+                if let Err(error) = session.replay(&self.out).await {
+                    if let Ok(mut sessions) = self.sessions.lock() {
+                        sessions.remove(&id);
+                    }
+                    session.drop_children(self);
+                    session.stop(&self.out);
+                    self.out.release(&id);
+                    return Err((FAILED, format!("its history could not be read: {error}")));
+                }
                 self.out
                     .replayed(&id, json!({"sessionUpdate": "replay_complete"}));
             }
@@ -973,6 +981,9 @@ struct State {
     /// Messages a turn took in while prompts were being sent, shown
     /// then: the prompt whose answer names one does not show it again.
     early: HashSet<i64>,
+    /// The keyed prompt that moved the lead, and where: sent again, it
+    /// goes as it went.
+    moved_by: Option<(String, String)>,
     /// The state last reported, as `state_update` has it.
     reported: Option<Value>,
     /// The model and effort the person picked, which the bot takes when
@@ -1842,13 +1853,18 @@ impl Session {
         // own, which a steer may not be, so a prompt that moves the lead
         // queues.
         let steer = state.running.is_some();
-        let moving = (!steer).then_some(bound.moving.as_ref()).flatten();
         // A key the client sends again with its prompt names the message
-        // it sent first: the daemon takes one message for one request id.
+        // it sent first: the daemon takes one message for one request id,
+        // sent as it was first, the move it made too.
         let request = match &key {
             Some(key) => keyed(key),
             None => crate::unique("acp"),
         };
+        let moving = match &state.moved_by {
+            Some((by, dir)) if *by == request => Some(dir),
+            _ => (!steer).then_some(bound.moving.as_ref()).flatten(),
+        }
+        .cloned();
         let mut asked = json!({"bot": bound.bot, "bot_id": bound.bot_id,
             "request_id": request,
             "prompt": text,
@@ -1857,7 +1873,7 @@ impl Session {
         if let Some(person) = person {
             asked["person"] = json!(person);
         }
-        if let Some(dir) = moving {
+        if let Some(dir) = &moving {
             asked["workspace"] = json!(dir);
         }
         let (client, bot) = (bound.client.clone(), bound.bot.clone());
@@ -1879,6 +1895,11 @@ impl Session {
             && !steer
         {
             bound.moving = None;
+        }
+        if let Some(dir) = moving
+            && key.is_some()
+        {
+            state.moved_by = Some((request, dir));
         }
         let message = reply["message"].as_i64();
         // Stopped while it was being sent: it is in, so it is answered,
@@ -2816,10 +2837,14 @@ impl Session {
     /// messages, the bot's replies and its calls as they ended. What only
     /// described its state then (its states, notices, options) is not
     /// history.
-    async fn replay(&self, out: &Out) {
+    /// What could not be read fails the replay: a transcript cut short
+    /// is not shown as whole.
+    async fn replay(&self, out: &Out) -> Result<(), String> {
         let (client, bot) = {
             let state = self.state.lock().await;
-            let Some(bound) = &state.bound else { return };
+            let Some(bound) = &state.bound else {
+                return Ok(());
+            };
             (bound.client.clone(), bound.bot.clone())
         };
         // Its nodes up to where the live follow took over, newest first as
@@ -2829,15 +2854,13 @@ impl Session {
         let mut nodes: Vec<(i64, i64)> = Vec::new();
         let mut from = Value::Null;
         loop {
-            let Ok(page) = client
+            let page = client
                 .request(
                     "history_nodes",
                     json!({"bot": bot, "from": from, "limit": 200}),
                 )
                 .await
-            else {
-                break;
-            };
+                .map_err(|e| e.to_string())?;
             nodes.extend(
                 (page["nodes"].as_array().into_iter().flatten())
                     .filter_map(|n| Some((n["node"].as_i64()?, n["turn"].as_i64()?)))
@@ -2866,16 +2889,14 @@ impl Session {
             let chunk: Vec<i64> = (nodes[next..(next + 100).min(nodes.len())].iter())
                 .map(|(node, _)| *node)
                 .collect();
-            let Ok(read) = client
+            let read = client
                 .request("history_items", json!({"bot": bot, "nodes": chunk}))
                 .await
-            else {
-                return;
-            };
+                .map_err(|e| e.to_string())?;
             // Fewer than asked when they are large.
             let items = read["items"].as_array().cloned().unwrap_or_default();
             if items.is_empty() {
-                return;
+                return Err("the history read came back empty".into());
             }
             next += items.len();
             for entry in &items {
@@ -2891,6 +2912,7 @@ impl Session {
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -4710,6 +4732,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_keyed_prompt_sent_again_goes_as_it_first_went() {
+        let agent = test_agent();
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let seen = submitted.clone();
+        let client = crate::tests::daemon_answering(move |asked| {
+            if asked["op"] == "submit" {
+                seen.lock().unwrap().push(asked.clone());
+                return json!({"message": 9});
+            }
+            json!({})
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        if let Some(bound) = &mut session.state.lock().await.bound {
+            bound.moving = Some("/elsewhere".into());
+        }
+        let params = json!({"sessionId": "s1", "idempotencyKey": "k1",
+            "prompt": [{"type": "text", "text": "go"}]});
+        for _ in 0..2 {
+            let answer = session.prompt(&agent, &params).await.unwrap();
+            assert_eq!(answer["messageId"], "calc.lead/9");
+        }
+        let sent = submitted.lock().unwrap();
+        let how: Vec<Value> = (sent.iter())
+            .map(|s| json!([s["delivery"], s["workspace"]]))
+            .collect();
+        assert_eq!(how.len(), 2);
+        assert_eq!(how[0], how[1]);
+        assert_eq!(how[0][0], "queue");
+    }
+
+    #[tokio::test]
+    async fn a_replay_that_cannot_read_its_history_fails() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("history_nodes") => json!({"nodes": [{"node": 3, "turn": 1}], "next_from": null}),
+            _ => json!({"error": {"code": "storage_error", "message": "gone"}}),
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client, "calc.lead", None);
+        assert!(session.replay(&agent.out).await.is_err());
+    }
+
+    #[tokio::test]
     async fn a_call_denied_at_its_gate_ends_failed() {
         let agent = test_agent();
         let client = crate::tests::daemon_answering(|asked| {
@@ -4961,7 +5027,7 @@ mod tests {
         agent
             .out
             .update("s1", json!({"sessionUpdate": "agent_message_chunk"}));
-        session.replay(&agent.out).await;
+        session.replay(&agent.out).await.unwrap();
         agent
             .out
             .replayed("s1", json!({"sessionUpdate": "replay_complete"}));
@@ -4991,7 +5057,7 @@ mod tests {
         );
         // Only up to where the live follow began: what came after is live.
         session.state.lock().await.upto = Some(13);
-        session.replay(&agent.out).await;
+        session.replay(&agent.out).await.unwrap();
         let last = updates(&written(&agent)).pop().map(|(_, u)| u);
         assert_eq!(last.map(|u| u["status"].clone()), Some(json!("completed")));
     }
