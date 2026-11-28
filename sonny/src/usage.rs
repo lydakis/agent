@@ -935,9 +935,10 @@ fn speeds(models: &[Row], total: &Spent, width: usize) -> Vec<Line<'static>> {
 const NAME: usize = 32;
 
 /// What the daemon counts since it started that the Daemon block reads
-/// as a rate: requests answered, writes the store committed, and events
-/// sent to the sessions that follow them.
-const RATES: [&str; 3] = ["requests", "store writes", "events sent"];
+/// as a rate: requests answered, the store's jobs (its reads and writes,
+/// as `stats` counts them together), and events sent to the sessions that
+/// follow them.
+const RATES: [&str; 3] = ["requests", "store jobs", "events sent"];
 
 /// What one `stats` read said of the daemon: how long it had been up,
 /// each of [`RATES`] and the processor time it spent since it started,
@@ -952,6 +953,8 @@ pub struct Reading {
     turn_limit: Option<u64>,
     paced: Option<u64>,
     commands: Option<u64>,
+    /// Of `commands`, those accepted and still in line for a slot.
+    queued: Option<u64>,
     command_limit: Option<u64>,
     rss: Option<u64>,
     peak: Option<u64>,
@@ -972,7 +975,7 @@ impl Reading {
             uptime_ms: process["uptime_ms"].as_u64()?,
             counts: [
                 requests,
-                stats["store"]["groups"]["jobs"].as_u64(),
+                stats["store"]["jobs"].as_u64(),
                 stats["hub"]["delivered"].as_u64(),
             ],
             cpu_ms: (process["cpu_user_ms"].as_u64())
@@ -982,6 +985,7 @@ impl Reading {
             turn_limit: limit(&stats["active_limit"]),
             paced: stats["paced_turns"].as_u64(),
             commands: stats["running_processes"].as_u64(),
+            queued: stats["queued_processes"].as_u64(),
             command_limit: limit(&stats["process_limit"]),
             rss: process["rss_bytes"].as_u64(),
             peak: process["peak_rss_bytes"].as_u64(),
@@ -1033,7 +1037,9 @@ impl Readings {
             Span::raw("Right now").bold(),
             Span::raw("  the whole daemon").dim(),
         ];
-        let Some(last) = &self.last else {
+        // A read that failed says so, and what an earlier one found is not
+        // shown as now; it is kept for the rates once a read lands again.
+        let Some(last) = self.last.as_ref().filter(|_| self.error.is_none()) else {
             head.push(
                 Span::raw(match &self.error {
                     Some(error) => format!(" · could not read it: {error}"),
@@ -1079,12 +1085,19 @@ impl Readings {
             };
             row("turns running", value, note);
         }
+        // The daemon counts those still in line for a slot among them.
         if let Some(commands) = last.commands {
+            let queued = last.queued.unwrap_or(0).min(commands);
+            let running = commands - queued;
             let value = match last.command_limit {
-                Some(limit) => format!("{commands} of {limit}"),
-                None => commands.to_string(),
+                Some(limit) => format!("{running} of {limit}"),
+                None => running.to_string(),
             };
-            row("commands running", value, String::new());
+            let note = match queued {
+                0 => String::new(),
+                n => format!("{n} more wait for a slot"),
+            };
+            row("commands running", value, note);
         }
         // The processor time it spent as a share of one core's, read as
         // the counts are.
@@ -2707,9 +2720,9 @@ mod tests {
     fn daemon_stats(uptime_s: u64, requests: u64) -> Value {
         json!({
             "active_turns": 27, "active_limit": 64, "paced_turns": 3,
-            "running_processes": 14, "process_limit": 32,
             "commands": {"ops": {"usage": {"count": requests / 2}, "submit": {"count": requests - requests / 2}}},
-            "store": {"jobs": 99_999, "groups": {"count": 10, "jobs": uptime_s * 6}},
+            "running_processes": 14, "queued_processes": 0, "process_limit": 32,
+            "store": {"jobs": uptime_s * 6, "groups": {"count": 10, "jobs": 99_999}},
             "hub": {"delivered": uptime_s * 190, "dropped": 0},
             "process": {
                 "uptime_ms": uptime_s * 1000, "cpu_user_ms": uptime_s * 60, "cpu_system_ms": uptime_s * 30,
@@ -2815,7 +2828,7 @@ mod tests {
             [
                 "Right now  the whole daemon · up 2d 4h",
                 "  requests                       21 a second   since it started",
-                "  store writes                    6 a second   since it started",
+                "  store jobs                      6 a second   since it started",
                 "  events sent                   190 a second   since it started",
                 "  turns running                     27 of 64   3 more wait on a provider's limit",
                 "  commands running                  14 of 32",
@@ -2880,12 +2893,37 @@ mod tests {
             lines.contains("  commands running                        14"),
             "{lines}"
         );
+        // Commands still in line for a slot are not running: the daemon
+        // counts them among `running_processes`.
+        let mut queued = daemon_stats(100, 100);
+        (queued["running_processes"], queued["queued_processes"]) = (json!(33), json!(3));
+        let mut readings = Readings::default();
+        readings.came(Ok(queued));
+        let lines = text(&readings.lines(90));
+        assert!(
+            lines.contains("  commands running                  30 of 32   3 more wait for a slot"),
+            "{lines}"
+        );
         // A read that failed says so, and the next one fills it in.
         let mut readings = Readings::default();
         readings.came(Err("connection refused".into()));
         assert_eq!(
             text(&readings.lines(90)),
             "Right now  the whole daemon · could not read it: connection refused"
+        );
+        // One that fails after one landed shows nothing it read before as
+        // now; the next that lands reads its rates from that earlier one.
+        readings.came(Ok(daemon_stats(100, 1_000)));
+        readings.came(Err("connection refused".into()));
+        assert_eq!(
+            text(&readings.lines(90)),
+            "Right now  the whole daemon · could not read it: connection refused"
+        );
+        readings.came(Ok(daemon_stats(110, 1_500)));
+        let lines = text(&readings.lines(90));
+        assert!(
+            lines.contains("  requests                       50 a second"),
+            "{lines}"
         );
     }
 
