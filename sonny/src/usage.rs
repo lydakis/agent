@@ -2911,9 +2911,13 @@ mod tests {
         // or a note goes whole: nothing in it is cut short.
         for width in [64, 72, 80] {
             let card = text(&view.card(width));
-            assert!(!block(&card).iter().any(|line| line.contains('…')), "{card}");
-            assert!(card.contains("busiest hour") == (width >= 58), "{card}");
+            assert!(
+                !block(&card).iter().any(|line| line.contains('…')),
+                "{card}"
+            );
+            assert!(card.contains("busiest hour"), "{card}");
         }
+        assert!(!text(&view.card(50)).contains("busiest hour"));
         for width in 20..=100 {
             let card = view.card(width);
             for line in block(&text(&card)) {
