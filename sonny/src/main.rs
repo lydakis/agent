@@ -17317,29 +17317,23 @@ impl App {
                     call["call_id"].as_str().unwrap_or_default(),
                 ) =>
             {
-                let decided = match decision.as_str() {
-                    "allow" => transcript::Decided::Allowed { you: true, kept },
-                    _ => transcript::Decided::Denied { you: true },
-                };
-                if let Some(written) = self.written.get_mut(&self.aside_key(&call)) {
-                    match (&mut written.decided, decided) {
-                        // Its own verdict came first and is final: what the
-                        // person kept is only added to an allow.
-                        (
-                            Some(transcript::Decided::Allowed { kept: heard, .. }),
-                            transcript::Decided::Allowed { kept, .. },
-                        ) if written.heard => {
-                            if heard.is_none() {
-                                *heard = kept;
-                            }
-                        }
-                        _ if written.heard => {}
-                        (_, decided) => written.decided = Some(decided),
-                    }
+                self.decide_written(&call, &decision, kept);
+            }
+            // A call below whose rows here the screen let go: what was
+            // answered is still kept, and said under it as for one's own.
+            Ok(_) if !own && self.written.contains_key(&self.aside_key(&call)) => {
+                self.decide_written(&call, &decision, kept.clone());
+                if decision == "allow" {
+                    let name = call["name"].as_str().unwrap_or("tool");
+                    let lines = transcript::allowed(
+                        name,
+                        &call["arguments"],
+                        kept.as_deref(),
+                        &self.workspace,
+                        self.width,
+                    );
+                    self.commit(lines);
                 }
-                // A call below answered here: kept here too.
-                let key = self.aside_key(&call);
-                self.keep_call_answer(&key, true);
             }
             Ok(_) if decision == "allow" => {
                 let name = call["name"].as_str().unwrap_or("tool");
@@ -20844,6 +20838,34 @@ impl App {
     /// An answer kept here ([`App::keep_answer`]) drawn in its place in a
     /// replay, folded as it was left: one still pinned here is drawn by
     /// its pin.
+    /// The person answered `call` here, written out by this window: its
+    /// copy says so until the call's own verdict, and an agent's below is
+    /// kept here too ([`App::keep_call_answer`]).
+    fn decide_written(&mut self, call: &Value, decision: &str, kept: Option<String>) {
+        let decided = match decision {
+            "allow" => transcript::Decided::Allowed { you: true, kept },
+            _ => transcript::Decided::Denied { you: true },
+        };
+        let key = self.aside_key(call);
+        if let Some(written) = self.written.get_mut(&key) {
+            match (&mut written.decided, decided) {
+                // Its own verdict came first and is final: what the
+                // person kept is only added to an allow.
+                (
+                    Some(transcript::Decided::Allowed { kept: heard, .. }),
+                    transcript::Decided::Allowed { kept, .. },
+                ) if written.heard => {
+                    if heard.is_none() {
+                        *heard = kept;
+                    }
+                }
+                _ if written.heard => {}
+                (_, decided) => written.decided = Some(decided),
+            }
+        }
+        self.keep_call_answer(&key, true);
+    }
+
     fn draw_kept_answer(&mut self, entry: answered::Entry) {
         let answered::Entry { after, what } = entry;
         match what {
@@ -20865,6 +20887,8 @@ impl App {
                 arguments,
                 rows,
                 decided,
+                heard,
+                at_ms,
             } => {
                 let key = (bot.clone(), turn, call.clone());
                 // Still drawn here, its own copy stands.
@@ -20881,10 +20905,10 @@ impl App {
                     arguments,
                     from: Some(bot.clone()),
                     decided: Some(decided),
-                    heard: true,
+                    heard,
                     folded: true,
                     open: false,
-                    at_ms: 0,
+                    at_ms,
                 };
                 let (shown, marks) = self.written_rows(&written);
                 let at = self.pending.len();
@@ -23569,6 +23593,8 @@ impl App {
                 arguments: written.arguments.clone(),
                 rows: written.rows.iter().map(Line::to_string).collect(),
                 decided: decided.clone(),
+                heard: written.heard,
+                at_ms: written.at_ms,
             },
         };
         if let Err(error) = self.answered.keep(entry) {
@@ -38761,6 +38787,62 @@ mod tests {
             1,
             "{texts:?}"
         );
+    }
+
+    /// A call below answered after the screen let its rows go is kept all
+    /// the same; and kept before its own verdict came, drawn again from the
+    /// start, it still reads that verdict from the trail once it comes.
+    #[tokio::test]
+    async fn a_tasks_request_answered_with_its_rows_gone_or_its_verdict_unheard_is_kept() {
+        let client = daemon_answering(|request| match request["op"].as_str() {
+            Some("audit") => json!({"rows": [
+                {"bot": "shop.fix", "turn": 4, "call_id": "c1", "step": null,
+                    "approved": "reviewer", "outcome": "denied"}],
+                "next_before": null}),
+            _ => json!({}),
+        })
+        .await;
+        let mut app = app(client);
+        app.bot = "home.lead".into();
+        app.width = 80;
+        app.raised
+            .push(json!({"bot": "shop.fix", "turn": 4, "call_id": "c1",
+            "name": "shell", "gates": ["manual", "auto"], "arguments": {"command": "cargo publish"}}));
+        app.show_asked();
+        app.flush();
+        // The lead wrote on: the request's rows went off the screen.
+        app.screen = screen::Screen::default();
+        let key = |code| Event::Key(event::KeyEvent::new(code, KeyModifiers::NONE));
+        app.key(key(KeyCode::Char('y'))).await;
+        app.beside_done().await;
+        let kept = answered::call_key("shop.fix", 4, "c1");
+        assert!(app.answered.has(&kept));
+        app.flush();
+        // Closed before its verdict came, and opened again.
+        app.raised.clear();
+        app.written.clear();
+        app.screen = screen::Screen::default();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        let texts = app.screen.texts();
+        assert_eq!(
+            texts,
+            ["✓ You allowed cargo publish · shop.fix"],
+            "{texts:?}"
+        );
+        // The reviewer's gate denied it meanwhile: read from the trail.
+        app.raise_approvals_through().await;
+        app.flush();
+        let denied = "✗ The reviewer denied cargo publish · shop.fix".to_owned();
+        let texts = app.screen.texts();
+        assert!(texts.contains(&denied), "{texts:?}");
+        app.screen = screen::Screen::default();
+        app.written.clear();
+        app.any_history = false;
+        app.draw_answers_before(None);
+        app.flush();
+        assert_eq!(app.screen.texts(), [denied]);
     }
 
     /// A call below answered here is kept where it was written out: drawn

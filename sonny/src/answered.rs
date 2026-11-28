@@ -41,6 +41,11 @@ pub enum What {
         arguments: serde_json::Value,
         rows: Vec<String>,
         decided: crate::transcript::Decided,
+        /// The call's own verdict was heard: `decided` is final. Until
+        /// then it is the person's answer, which another gate may still
+        /// overrule, read again from the audit trail since `at_ms`.
+        heard: bool,
+        at_ms: i64,
     },
 }
 
