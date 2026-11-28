@@ -2137,7 +2137,8 @@ impl Service {
     fn makers(&self, bot: &str) -> Vec<String> {
         let mut above: Vec<String> = Vec::new();
         let mut at = bot.to_owned();
-        while let Some(by) = (self.records.get(&at)).and_then(|record| record["created_by"].as_str())
+        while let Some(by) =
+            (self.records.get(&at)).and_then(|record| record["created_by"].as_str())
         {
             if by == bot || above.iter().any(|seen| seen == by) {
                 break;
@@ -4219,10 +4220,12 @@ mod tests {
     /// asked unknown.
     fn says(text: &str) -> impl Fn(&activity::Pending) -> activity::Read + '_ {
         move |pending| match &pending.kind {
-            activity::Kind::Words { .. } | activity::Kind::Answered { .. } => activity::Read::Words {
-                text: text.to_owned(),
-                someone: false,
-            },
+            activity::Kind::Words { .. } | activity::Kind::Answered { .. } => {
+                activity::Read::Words {
+                    text: text.to_owned(),
+                    someone: false,
+                }
+            }
             activity::Kind::Reply { .. } => activity::Read::Reply {
                 text: text.to_owned(),
                 asker: None,
@@ -4305,8 +4308,15 @@ mod tests {
         // hears it on the lead, quoted from the task; the lead, which
         // watches the task, hears the task's own words and not again.
         let answer = json!({"request_id": "answer-0a1b", "node": 12});
-        feed(&mut service, ev("calc.parser", 5, "accepted", answer.clone()), 30);
-        assert_eq!(heard(&service, "home.lead"), [("answered".into(), "calc.lead".into())]);
+        feed(
+            &mut service,
+            ev("calc.parser", 5, "accepted", answer.clone()),
+            30,
+        );
+        assert_eq!(
+            heard(&service, "home.lead"),
+            [("answered".into(), "calc.lead".into())]
+        );
         let told = &service.lookouts["home.lead"].heard[0].event;
         assert_eq!(told.quote, Some(("calc.parser".into(), 5)));
         assert_eq!(told.fields["asker"], "calc.parser");
@@ -4314,15 +4324,26 @@ mod tests {
         assert_eq!(told.fields["text"], answered);
         assert!(!told.text.contains("The spec"), "the daemon quotes it");
         assert!(!told.steer);
-        assert_eq!(heard(&service, "calc.lead"), [("wrote".into(), "calc.parser".into())]);
+        assert_eq!(
+            heard(&service, "calc.lead"),
+            [("wrote".into(), "calc.parser".into())]
+        );
         // From a task's own task, steered in: still once, on the lead.
         let steer = json!({"request_id": "answer-2c3d", "delivery": "steer"});
         let queued = json!({"bot": "calc.parser-tests", "turn": null, "message": 8,
             "event": "queued", "data": steer});
         feed(&mut service, queued, 31);
-        assert_eq!(heard(&service, "home.lead").len(), 1, "told once it is taken in");
+        assert_eq!(
+            heard(&service, "home.lead").len(),
+            1,
+            "told once it is taken in"
+        );
         let steered = json!({"message": 8, "node": 20});
-        feed(&mut service, ev("calc.parser-tests", 7, "steered", steered), 32);
+        feed(
+            &mut service,
+            ev("calc.parser-tests", 7, "steered", steered),
+            32,
+        );
         let superlead = heard(&service, "home.lead");
         assert_eq!(superlead.len(), 2);
         assert_eq!(superlead[1], ("answered".into(), "calc.lead".into()));

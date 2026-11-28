@@ -489,8 +489,9 @@ impl Answers {
         let turn = super::number(event)?;
         let key = (task.to_owned(), turn);
         match kind {
-            "accepted" => (!self.queued.remove(&key) && answer(data))
-                .then(|| (turn, data["node"].as_i64())),
+            "accepted" => {
+                (!self.queued.remove(&key) && answer(data)).then(|| (turn, data["node"].as_i64()))
+            }
             "queued" if answer(data) && data["delivery"] == "steer" => {
                 if self.steers.len() >= CALLS {
                     self.steers.clear();
@@ -853,9 +854,7 @@ mod tests {
     fn an_answer_is_told_once_as_it_reaches_the_agent_that_asked() {
         let mut answers = Answers::default();
         let answer = |delivery: &str| json!({"request_id": "answer-0a1b", "delivery": delivery});
-        let in_line = |kind: &str, data: Value| {
-            json!({"bot": "calc.ui", "turn": null, "message": 4, "event": kind, "data": data})
-        };
+        let in_line = |kind: &str, data: Value| json!({"bot": "calc.ui", "turn": null, "message": 4, "event": kind, "data": data});
         // Taken in as a turn starts.
         let started = json!({"request_id": "answer-0a1b", "node": 9});
         assert_eq!(
@@ -863,15 +862,26 @@ mod tests {
             Some((3, Some(9)))
         );
         // Put in line: told then, not again as its turn starts.
-        assert_eq!(answers.event(&in_line("queued", answer("queue"))), Some((4, None)));
         assert_eq!(
-            answers.event(&ev("calc.ui", 4, "accepted", json!({"request_id": "answer-0a1b"}))),
+            answers.event(&in_line("queued", answer("queue"))),
+            Some((4, None))
+        );
+        assert_eq!(
+            answers.event(&ev(
+                "calc.ui",
+                4,
+                "accepted",
+                json!({"request_id": "answer-0a1b"})
+            )),
             None
         );
         // A steer is told once taken in; one that ends in line never.
         assert_eq!(answers.event(&in_line("queued", answer("steer"))), None);
         let taken = json!({"message": 4, "node": 11});
-        assert_eq!(answers.event(&ev("calc.ui", 5, "steered", taken.clone())), Some((4, Some(11))));
+        assert_eq!(
+            answers.event(&ev("calc.ui", 5, "steered", taken.clone())),
+            Some((4, Some(11)))
+        );
         assert_eq!(answers.event(&in_line("queued", answer("steer"))), None);
         assert_eq!(answers.event(&in_line("message_ended", json!({}))), None);
         assert_eq!(answers.event(&ev("calc.ui", 5, "steered", taken)), None);
