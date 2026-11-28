@@ -767,6 +767,8 @@ struct ProjectsKept {
     waiting: std::collections::HashSet<String>,
     version: Option<u64>,
     pins: Vec<String>,
+    /// The pins the last read did not find listed.
+    gone: Vec<String>,
     job: Option<tokio::task::JoinHandle<Option<ProjectsRead>>>,
     /// The project picked to go to, as the page showed it: the window
     /// opened on its lead shows its counts and agents from its first
@@ -799,6 +801,7 @@ impl ProjectsKept {
         self.waiting = read.waiting;
         self.version = Some(read.version);
         self.pins = read.pins;
+        self.gone = read.gone;
     }
 }
 
@@ -854,6 +857,7 @@ impl App {
                 if !kept.projects.is_empty() {
                     view.set(std::mem::take(&mut kept.projects), now_ms());
                 }
+                view.set_gone(std::mem::take(&mut kept.gone));
                 *kept
             }
             // The projects as any window last showed them show at once,
@@ -918,6 +922,7 @@ impl App {
             waiting: std::mem::take(&mut open.waiting),
             version: open.version,
             pins: std::mem::take(&mut open.pins),
+            gone: open.view.take_gone(),
             job: open.job.take(),
             picked: None,
         };
@@ -31843,6 +31848,13 @@ mod tests {
         app.toggle_pin("tally.gone");
         let open = app.projects.as_mut().unwrap();
         open.view.set_gone(vec!["tally.gone".into()]);
+        app.key(pressed(KeyCode::Char('2'))).await;
+        assert!(app.projects.is_some());
+        assert_eq!(app.notice.as_deref(), Some("tally.gone is not there"));
+        // Closed and opened again, it is still not there, before any read.
+        app.close_projects();
+        app.open_projects().await;
+        app.notice = None;
         app.key(pressed(KeyCode::Char('2'))).await;
         assert!(app.projects.is_some());
         assert_eq!(app.notice.as_deref(), Some("tally.gone is not there"));

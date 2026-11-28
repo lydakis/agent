@@ -259,6 +259,12 @@ impl View {
         self.gone = gone;
     }
 
+    /// The pins not there any more, as the last read found them, taken
+    /// as the page closes, to be shown again as it opens.
+    pub fn take_gone(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.gone)
+    }
+
     #[cfg(test)]
     pub fn pins(&self) -> &[String] {
         &self.pins
