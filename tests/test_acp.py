@@ -994,14 +994,17 @@ class AcpTests(ModelFixture):
         thread.send({'id': live['id'], 'result': {'action': 'accept', 'content': {'pick': '2'},
                                                   '_meta': {'person': 'Ana Lopez'}}})
         hello = thread.ask('session/prompt', {'sessionId': session, 'prompt': [{'type': 'text', 'text': 'hello'}]})
-        thread.ended(hello, session)
+        _, updates, _ = thread.ended(hello, session)
+        # The first end after it was shown may be the turn's it waited
+        # behind, when that turn ended before taking it in: it runs next.
         later = []
-        while True:
+        deadline = time.monotonic() + 30
+        while not any('hello' in request for request in later):
+            self.assertLess(time.monotonic(), deadline, updates)
             try:
-                later.append(json.dumps(self.model.requests.get_nowait()['input']))
+                later.append(json.dumps(self.model.requests.get(timeout=1)['input']))
             except queue.Empty:
-                break
-        self.assertTrue(any('hello' in request for request in later))
+                continue
         self.assertFalse(any('script-1): Which queue' in request for request in later))
 
     def test_the_tasks_questions_come_to_its_subagent_session_as_forms(self):
