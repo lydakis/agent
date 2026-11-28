@@ -262,6 +262,7 @@ impl Agent {
             draft: None,
             reopened: false,
             land: false,
+            before: None,
         };
         Arc::new(Agent {
             out: Arc::new(Out::default()),

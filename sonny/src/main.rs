@@ -509,6 +509,11 @@ struct Options {
     /// `enter` on its row in `/status`): what it needs is brought into
     /// view once known.
     land: bool,
+    /// The agent the window this one opened in place of showed
+    /// (`/switch`, `alt+n`, `ctrl+6`, ...): where `ctrl+6` goes. The
+    /// window's own, handed from each of its agents to the next and kept
+    /// nowhere else.
+    before: Option<String>,
 }
 
 fn usage() -> String {
@@ -1049,6 +1054,32 @@ impl App {
                 self.switch_window(to);
             }
         }
+    }
+
+    /// `ctrl+6`: the window becomes the agent it showed before, as
+    /// `/switch` makes it, with what is typed as `alt+n` takes it; pressed
+    /// there, it comes back. Asked of the daemon beside the window first,
+    /// so one removed since is said and the window stays.
+    fn go_back(&mut self) {
+        let Some(before) = (self.options.before.clone()).filter(|before| *before != self.bot)
+        else {
+            self.notice = Some("no agent before this one".into());
+            return;
+        };
+        let (client, woken) = (self.client.clone(), self.woken.clone());
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let read = match client.request("inspect", json!({"bot": before})).await {
+                Ok(_) => Switching::Back(before),
+                Err(error) if error.code == "bot_not_found" => {
+                    Switching::Failed(format!("{before} is not there"))
+                }
+                Err(error) => Switching::Failed(error.to_string()),
+            };
+            let _ = send.send(read);
+            woken.notify_one();
+        });
+        self.switch_reading = Some((self.acted, receive));
     }
 
     /// While **Projects** is open, every project read again once its
@@ -3584,7 +3615,7 @@ fn parse() -> Result<Options, String> {
     let (mut layout, mut rex_host, mut sound) = (true, None, true);
     let (mut side, mut embedded) = (None, false);
     let (mut window_place, mut send, mut draft, mut reopened) = (None, None, None, false);
-    let mut land = false;
+    let (mut land, mut before) = (false, None);
     let mut lead = project::Pick::Last;
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
@@ -3620,6 +3651,9 @@ fn parse() -> Result<Options, String> {
             // Unlisted: how going to an agent that needs the person lands
             // on what it needs.
             "--land" => land = true,
+            // Unlisted: how a window hands on the agent it showed, for
+            // `ctrl+6` to go back to.
+            "--before" => before = Some(value()?),
             _ => return Err(usage()),
         }
     }
@@ -3642,6 +3676,7 @@ fn parse() -> Result<Options, String> {
         draft,
         reopened,
         land,
+        before,
     })
 }
 
@@ -3657,7 +3692,7 @@ fn reopen(bot: &str) -> Vec<String> {
         match arg.as_str() {
             "--new" | "--reopened" | "--land" => {}
             "--folder" | "--lead" | "--agent" | "--window-place" | "--send-file"
-            | "--draft-file" => {
+            | "--draft-file" | "--before" => {
                 args.next();
             }
             "--new-lead" => {
@@ -4485,6 +4520,8 @@ async fn run() -> Result<bool, String> {
         if app.land_after {
             args.push("--land".into());
         }
+        // The agent this window showed, for `ctrl+6` there to come back to.
+        args.extend(["--before".into(), app.bot.clone()]);
         // The next window's own arguments, as a Sonny started on it has.
         let mut given = vec![std::env::args().next().unwrap_or_else(|| "sonny".into())];
         given.extend(args);
@@ -4508,6 +4545,10 @@ async fn run() -> Result<bool, String> {
         }
         let mut args = reopen(&app.bot).split_off(1);
         args.push("--reopened".into());
+        // The same window: `ctrl+6` goes where it went before.
+        if let Some(before) = &app.options.before {
+            args.extend(["--before".into(), before.clone()]);
+        }
         if let Some(place) = place {
             args.extend(["--window-place".into(), mux::Place::encode(&place)]);
         }
@@ -5717,7 +5758,7 @@ const ZEN_ENDS: &str = "End zen and hear what was kept";
 
 /// Every key Sonny takes and what it does, as `?` lists them; a tip in
 /// the empty composer names only these.
-const SHORTCUTS: [(&str, &str); 25] = [
+const SHORTCUTS: [(&str, &str); 26] = [
     ("enter", "send, or steer the running turn"),
     ("tab", "queue for after the running turn"),
     ("↑↓", "earlier prompts, past the first or last row"),
@@ -5738,6 +5779,7 @@ const SHORTCUTS: [(&str, &str); 25] = [
         "with nothing typed, the agent above or below",
     ),
     ("alt+n", "the next agent that needs you"),
+    ("ctrl+6", "back to the agent before; again to return"),
     ("ctrl+\\", "keys to the pane and back"),
     ("ctrl+[ ctrl+]", "hide the pane, show it again"),
     ("ctrl+g", "open the pane's agent in the main view"),
@@ -6227,6 +6269,9 @@ type Again = (u64, (Vec<(i64, Value)>, bool), PageRead);
 enum Switching {
     /// The agent named, found.
     To(String),
+    /// The agent this window showed before, there still: gone back to
+    /// with what is typed, as `alt+n` goes ([`App::go_back`]).
+    Back(String),
     /// Every agent, to list, narrowed by what was typed: ordered and
     /// titled beside the window, the agents listed closed, and the picks
     /// kept.
@@ -19625,6 +19670,10 @@ impl App {
                     }
                     // The next agent that needs the person, typed or not.
                     KeyCode::Char('n') if alt && self.projects_here() => self.next_needing(),
+                    // The agent this window showed before, typed or not.
+                    // A plain terminal sends ctrl+6 as control with 6;
+                    // some report it as ctrl+^.
+                    KeyCode::Char('6' | '^') if ctrl && self.projects_here() => self.go_back(),
                     KeyCode::Char('b') if alt => self.input.word_left(),
                     KeyCode::Char('f') if alt => self.input.word_right(),
                     KeyCode::Char('d') if alt => self.input.delete_word_forward(),
@@ -22847,6 +22896,11 @@ impl App {
         }
         let (typed, agents, pick, closed, picks) = match read {
             Switching::To(bot) => {
+                self.switch_window(bot);
+                return;
+            }
+            Switching::Back(bot) => {
+                self.carry_draft = true;
                 self.switch_window(bot);
                 return;
             }
@@ -27584,6 +27638,7 @@ mod tests {
             draft: None,
             reopened: false,
             land: false,
+            before: None,
         };
         App::new(client, "b", &json!({"name": "b"}), options)
     }
@@ -31201,6 +31256,178 @@ mod tests {
         app.zen = Some("the rounding".into());
         app.key(alt_n).await;
         assert_eq!(app.notice, None);
+    }
+
+    fn ctrl(c: char) -> Event {
+        Event::Key(event::KeyEvent::new(
+            KeyCode::Char(c),
+            KeyModifiers::CONTROL,
+        ))
+    }
+
+    /// A daemon that knows `calc.lead`, `calc.readme`, `calc.halves` and
+    /// `calc.divide`, and no other.
+    async fn calc_daemon() -> Arc<Client> {
+        daemon_answering(|asked| match asked["op"].as_str() {
+            Some("inspect") => match asked["bot"].as_str() {
+                Some("calc.lead" | "calc.readme" | "calc.halves" | "calc.divide") => {
+                    json!({"name": asked["bot"]})
+                }
+                _ => json!({"error": "bot_not_found", "detail": "no such bot"}),
+            },
+            _ => json!({}),
+        })
+        .await
+    }
+
+    /// `bot`'s window in project `calc`, opened in place of one that
+    /// showed `before`, as [`run`] opens it with `--before`.
+    fn calc_window(client: &Arc<Client>, bot: &str, before: Option<&str>) -> App {
+        let mut app = app(client.clone());
+        app.bot = bot.into();
+        app.project = Some("calc".into());
+        app.workspace = "/w/calc".into();
+        app.options.before = before.map(str::to_owned);
+        app
+    }
+
+    /// The window `left` went to, opened in its place: `run` hands it the
+    /// agent `left` showed.
+    fn opened_after(left: &mut App, client: &Arc<Client>) -> App {
+        let to = left.switch_to.take().expect("the window went to an agent");
+        calc_window(client, &to, Some(&left.bot))
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_goes_back_to_the_agent_before_and_again_comes_back() {
+        let client = calc_daemon().await;
+        let mut lead = calc_window(&client, "calc.lead", None);
+        lead.input.set("/switch halves");
+        lead.submit().await;
+        lead.beside_done().await;
+        let mut halves = opened_after(&mut lead, &client);
+        assert_eq!(halves.bot, "calc.halves");
+        halves.key(ctrl('6')).await;
+        halves.beside_done().await;
+        assert_eq!(halves.switch_to.as_deref(), Some("calc.lead"));
+        assert!(halves.quit);
+        // Again, from there: back to the one it came from.
+        let mut back = opened_after(&mut halves, &client);
+        assert_eq!(back.bot, "calc.lead");
+        back.key(ctrl('6')).await;
+        back.beside_done().await;
+        assert_eq!(back.switch_to.as_deref(), Some("calc.halves"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_after_steps_goes_to_the_one_just_before_not_the_first() {
+        use crate::status::{Agents, Group, Listed};
+        let client = calc_daemon().await;
+        let listed = ["lead", "readme", "halves", "divide"].map(|name| Listed {
+            bot: format!("calc.{name}"),
+            name: name.into(),
+            title: String::new(),
+            state: "working".into(),
+            group: Group::Working,
+            lead: name == "lead",
+            helpers: Vec::new(),
+            run: None,
+            of: 0,
+            agents: Vec::new(),
+        });
+        let agents = Agents {
+            project: "calc".into(),
+            listed: listed.to_vec(),
+            ..Agents::default()
+        };
+        let alt_right = Event::Key(event::KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        let mut window = calc_window(&client, "calc.lead", None);
+        for to in ["calc.readme", "calc.halves", "calc.divide"] {
+            window.margin.set_agents(agents.clone(), &window.bot);
+            window.key(alt_right.clone()).await;
+            window = opened_after(&mut window, &client);
+            assert_eq!(window.bot, to);
+        }
+        window.key(ctrl('6')).await;
+        window.beside_done().await;
+        assert_eq!(window.switch_to.as_deref(), Some("calc.halves"));
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_with_words_typed_goes_and_carries_them_as_alt_n_does() {
+        let client = calc_daemon().await;
+        let mut app = calc_window(&client, "calc.halves", Some("calc.lead"));
+        app.input.set("fix it");
+        app.key(ctrl('6')).await;
+        // Nothing typed by the key.
+        assert_eq!(&*app.input, "fix it");
+        app.beside_done().await;
+        assert_eq!(app.switch_to.as_deref(), Some("calc.lead"));
+        // The words go on to the next window, as `alt+n` takes them.
+        assert!(app.carry_draft);
+        assert_eq!(&*app.input, "fix it");
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_with_none_before_says_so() {
+        let client = calc_daemon().await;
+        let mut app = calc_window(&client, "calc.lead", None);
+        app.key(ctrl('6')).await;
+        app.beside_done().await;
+        assert_eq!(app.notice.as_deref(), Some("no agent before this one"));
+        assert!(app.switch_to.is_none() && !app.quit);
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_to_an_agent_removed_names_it_and_the_window_stays() {
+        let client = calc_daemon().await;
+        let mut app = calc_window(&client, "calc.lead", Some("calc.gone"));
+        app.input.set("fix it");
+        app.key(ctrl('6')).await;
+        app.beside_done().await;
+        assert_eq!(app.notice.as_deref(), Some("calc.gone is not there"));
+        assert!(app.switch_to.is_none() && !app.quit);
+        assert_eq!(&*app.input, "fix it");
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_and_ctrl_caret_both_go_back() {
+        let client = calc_daemon().await;
+        for key in [ctrl('6'), ctrl('^')] {
+            let mut app = calc_window(&client, "calc.halves", Some("calc.lead"));
+            app.key(key).await;
+            app.beside_done().await;
+            assert_eq!(app.switch_to.as_deref(), Some("calc.lead"));
+        }
+    }
+
+    #[tokio::test]
+    async fn ctrl_6_does_nothing_in_zen_a_side_chat_or_an_agent_shown_beside() {
+        let client = calc_daemon().await;
+        let ways: [fn(&mut App); 3] = [
+            |app| app.zen = Some("the rounding".into()),
+            |app| app.options.side = Some(1),
+            |app| app.options.embedded = true,
+        ];
+        for way in ways {
+            let mut app = calc_window(&client, "calc.halves", Some("calc.lead"));
+            way(&mut app);
+            app.key(ctrl('6')).await;
+            app.beside_done().await;
+            assert!(app.switch_to.is_none() && !app.quit);
+            assert!(app.switch_reading.is_none());
+            assert_eq!(app.notice, None);
+            assert!(app.input.is_empty());
+        }
+    }
+
+    #[test]
+    fn ctrl_6_is_on_the_keys_sheet() {
+        assert!(
+            SHORTCUTS
+                .iter()
+                .any(|(key, does)| *key == "ctrl+6" && does.contains("before"))
+        );
     }
 
     #[tokio::test]

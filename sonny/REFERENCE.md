@@ -205,6 +205,17 @@ its ends, as a multiplexer's previous and next tab: the window becomes that
 agent's, and from one the list does not show they go to the lead. With
 words typed, all of them move the cursor.
 
+`ctrl+6` (or `ctrl+^`, as some terminals report it) makes the window the
+agent it showed before, as `/switch` makes it, and pressed again comes
+back, as vim's `ctrl+^` and tmux's `last-window` do. Before is whatever
+the window showed last, however it went: `/switch`, a click, `enter`,
+`alt+n`, `alt+←` and `alt+→`, or `ctrl+6` itself. Each window has its own,
+and none is kept past the window. It types nothing, so with words typed it
+goes too and takes them along, as `alt+n` does. With none before it says
+`no agent before this one`; an agent removed since is named with `is not
+there`, and the window stays. Zen, a side chat and an agent shown beside
+keep you where you are: there it does nothing.
+
 The footer says `← ? N` for the agents that need you in every other
 project: a call held for your approval, or a question still open. The
 muted `←` is the key that shows them, and tells this `?` from the
