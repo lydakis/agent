@@ -2792,12 +2792,26 @@ impl Session {
         let Ok(tasks) = tasks_of(client, lead_id).await else {
             return;
         };
+        let lead = (self.state.lock().await.bound.as_ref()).map(|b| b.bot.clone());
+        let project = lead.as_deref().and_then(project::lead_project);
+        // Those with a message still in line, as a new task's brief
+        // waiting for room: they run once the daemon takes it in.
+        let waiting = match project {
+            Some(project) => in_line(client, &format!("{}.*", glob_literal(project))).await,
+            None => HashSet::new(),
+        };
         let now = now_ms();
-        for task in tasks.iter().filter(|task| lately(task, now)) {
+        for task in &tasks {
             let Some(name) = task["name"].as_str() else {
                 continue;
             };
-            let running = task["running_turn"].as_i64().is_some();
+            let queued = task["bot_id"]
+                .as_i64()
+                .is_some_and(|id| waiting.contains(&id));
+            if !queued && !lately(task, now) {
+                continue;
+            }
+            let running = task["running_turn"].as_i64().is_some() || queued;
             // One closed, by itself or its lead, with no turn since, is
             // done: it has nothing open.
             if crate::resolved::done(crate::resolved::closed(task), running) {
@@ -3164,6 +3178,35 @@ fn lately(task: &Value, now: i64) -> bool {
         || task["last"]["finished_ms"]
             .as_i64()
             .is_some_and(|ended| now - ended <= LATELY_MS)
+}
+
+/// The bots, by id, among those `glob` matches, with a message still in
+/// line: queued, or ready to run once the daemon has room.
+async fn in_line(client: &Client, glob: &str) -> HashSet<i64> {
+    let mut bots = HashSet::new();
+    let mut after = 0;
+    loop {
+        let asked = json!({"bot": glob, "after": after, "limit": 256, "waiting": true});
+        let Ok(page) = client.request("messages", asked).await else {
+            return bots;
+        };
+        let rows = page["messages"].as_array().into_iter().flatten();
+        bots.extend(rows.filter_map(|row| row["bot_id"].as_i64()));
+        match page["next_after"].as_i64() {
+            Some(next) => after = next,
+            None => return bots,
+        }
+    }
+}
+
+/// `text` as a GLOB pattern that matches it alone.
+fn glob_literal(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '*' | '?' | '[' => format!("[{c}]"),
+            c => c.to_string(),
+        })
+        .collect()
 }
 
 fn now_ms() -> i64 {
@@ -4953,6 +4996,39 @@ mod tests {
             brief(&client, "calc.fix").await,
             Some((4, "Fix it".into(), true))
         );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_lead_adopts_a_task_whose_brief_waits_in_line() {
+        let agent = test_agent();
+        let client = crate::tests::daemon_answering(|asked| match asked["op"].as_str() {
+            Some("bots") => json!({"bots": [{"name": "calc.fix", "bot_id": 9,
+                "created_by": "calc.lead", "running_turn": null, "last": null}],
+                "next_after": null}),
+            Some("messages") if asked["waiting"] == true => {
+                assert_eq!(asked["bot"], "calc.*");
+                json!({"messages": [{"bot": "calc.fix", "bot_id": 9, "message": 4,
+                    "status": "queued"}], "next_after": null})
+            }
+            Some("messages") => json!({"messages": [{"message": 4, "status": "queued"}]}),
+            Some("prompts") => json!({"prompts": [{"text": "Fix it"}]}),
+            Some("inspect") => json!({"name": "calc.fix", "bot_id": 9, "workspace": "/w"}),
+            _ => json!({}),
+        })
+        .await;
+        let session = bound_session(&agent, "s1", client.clone(), "calc.lead", None);
+        session.adopt_tasks(&agent, &client, 3).await;
+        let sessions = agent.sessions.lock().unwrap();
+        assert!(
+            sessions.keys().any(|id| id.starts_with("s1/")),
+            "its task is followed: {:?}",
+            sessions.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_glob_matches_a_name_alone() {
+        assert_eq!(glob_literal("a*b?[c]"), "a[*]b[?][[]c]");
     }
 
     #[tokio::test]
